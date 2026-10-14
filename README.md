@@ -12,7 +12,7 @@ The app UI is available in English and Turkish. It follows the macOS language by
 - Per-input nicknames, raw DDC values and DDC command mode
 - Brightness and volume sliders, plus optional keyboard-key control
 - Two-Mac setup: the Macs find each other over Bonjour and forward switch requests
-- Input discovery, diagnostics log and in-app updates
+- Guided input discovery, monitor presets, diagnostics log and in-app updates
 
 ---
 
@@ -117,7 +117,14 @@ With `Auto`, a display whose name contains "LG" is sent `input-alt` with the LG 
 
 ### Discover Inputs
 
-**Discover Inputs...** tries common `input` and `input-alt` values one by one. If the screen switches away, the app switches back automatically (directly or through the other Mac). When it finishes, **Apply to List** copies the working values into the list; press **Save** to keep them. If the screen gets stuck on an empty input, press the monitor's own input button to return to this Mac.
+**Discover Inputs...** is a guided, step-by-step flow for monitors that can't report which input is active (many LG models always answer `0`).
+
+1. Pick which port **this Mac** is connected to; the app uses it to switch back after each try.
+2. The app sends one candidate `input` / `input-alt` value, waits about 3 seconds, then switches back to this Mac's port (directly, or through the other Mac if the display left this one).
+3. You are asked whether the screen switched and which port the monitor showed (or "No change"). Choose **Next**, **Retry this value** or **Finish now**.
+4. The summary lists each port with the value that worked. **Apply to List** fills the rows whose name matches the port; press **Save** to keep them.
+
+During the run the screen will briefly go to other ports. If it doesn't come back, press the monitor's own input button to return to this Mac's port; discovery continues when the display is back.
 
 ### Two Macs on one monitor
 
@@ -198,6 +205,16 @@ LG monitors don't fully support standard DDC/CI input switching. Use `input-alt 
 | USB-C         | 210               |
 
 On LG models with a single DisplayPort (e.g. LG HDR 4K / 27UL850), USB-C is usually **209** instead of 210 (m1ddc lists 209 as "DisplayPort 2"). If USB-C doesn't switch, try 209.
+
+### Known monitor presets
+
+When the selected display matches a known model, **Edit Input List...** shows a **Load preset: &lt;model&gt;** button. It replaces the port values and commands; nicknames, cycle flags and hotkeys are kept, and nothing is saved until you press **Save**. On a first run (no saved input list) a matching preset is applied automatically, and it is also applied when you save with a newly selected matching display while the list is still the built-in default. A customized list is never overwritten silently.
+
+| Model | DisplayPort | USB-C | HDMI 1 | HDMI 2 | Command |
+|-------|-------------|-------|--------|--------|---------|
+| LG HDR 4K (27UL850) | 208 (unconfirmed) | 209 | 144 | 145 | `input-alt` |
+
+Have a different model? Run **Discover Inputs...** and report your values at <https://github.com/ozangulhn/InputSwitcher/issues> so they can be added.
 
 ---
 

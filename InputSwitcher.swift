@@ -81,6 +81,68 @@ enum InputCommandMode: String, CaseIterable {
     }
 }
 
+extension InputSource {
+    static let builtInDefaults: [InputSource] = [
+        InputSource(name: "DisplayPort 1", value: 15, icon: "cable.connector.horizontal", nickname: "", includeInShortcutCycle: false, commandMode: .auto),
+        InputSource(name: "DisplayPort 2", value: 16, icon: "cable.connector.horizontal", nickname: "", includeInShortcutCycle: false, commandMode: .auto),
+        InputSource(name: "HDMI 1", value: 17, icon: "tv", nickname: "", includeInShortcutCycle: false, commandMode: .auto),
+        InputSource(name: "HDMI 2", value: 18, icon: "tv", nickname: "", includeInShortcutCycle: false, commandMode: .auto),
+        InputSource(name: "USB-C", value: 27, icon: "cable.connector", nickname: "", includeInShortcutCycle: false, commandMode: .auto)
+    ]
+
+    static func matchesBuiltInDefaults(_ inputs: [InputSource]) -> Bool {
+        guard inputs.count == builtInDefaults.count else { return false }
+        return zip(inputs, builtInDefaults).allSatisfy {
+            $0.name == $1.name && $0.value == $1.value && $0.commandMode == $1.commandMode
+        }
+    }
+}
+
+// Known monitor models. To add one, append an entry to `all`.
+// Confirmed on real hardware: LG HDR 4K (27UL850) HDMI 1, HDMI 2, USB-C.
+// Unconfirmed (from m1ddc docs): LG HDR 4K DisplayPort 208.
+struct DisplayPreset {
+    let name: String
+    let matches: [String]
+    let inputs: [InputSource]
+
+    static let all: [DisplayPreset] = [
+        DisplayPreset(
+            name: "LG HDR 4K",
+            matches: ["lg hdr 4k"],
+            inputs: [
+                InputSource(name: "DisplayPort 1", value: 208, icon: "cable.connector.horizontal", nickname: "", includeInShortcutCycle: false, commandMode: .lgAlternate),
+                InputSource(name: "HDMI 1", value: 144, icon: "tv", nickname: "", includeInShortcutCycle: false, commandMode: .lgAlternate),
+                InputSource(name: "HDMI 2", value: 145, icon: "tv", nickname: "", includeInShortcutCycle: false, commandMode: .lgAlternate),
+                InputSource(name: "USB-C", value: 209, icon: "cable.connector", nickname: "", includeInShortcutCycle: false, commandMode: .lgAlternate)
+            ]
+        )
+    ]
+
+    static func match(displayTitle: String?) -> DisplayPreset? {
+        guard let identity = normalizedDisplayIdentity(displayTitle) else { return nil }
+        return all.first { preset in preset.matches.contains { identity.contains($0) } }
+    }
+
+    // Takes the preset's ports and values; keeps nickname, cycle flag and hotkey of same-named existing inputs.
+    func applied(to existing: [InputSource]) -> [InputSource] {
+        inputs.map { presetInput in
+            guard let old = existing.first(where: { $0.name.caseInsensitiveCompare(presetInput.name) == .orderedSame }) else {
+                return presetInput
+            }
+            return InputSource(
+                name: presetInput.name,
+                value: presetInput.value,
+                icon: presetInput.icon,
+                nickname: old.nickname,
+                includeInShortcutCycle: old.includeInShortcutCycle,
+                commandMode: presetInput.commandMode,
+                hotKey: old.hotKey
+            )
+        }
+    }
+}
+
 struct ShellResult {
     let status: Int32
     let output: String
@@ -1587,13 +1649,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     let hotKeyID = EventHotKeyID(signature: fourCharCode("ISWT"), id: 1)
 
-    var inputs: [InputSource] = [
-        InputSource(name: "DisplayPort 1", value: 15, icon: "cable.connector.horizontal", nickname: "", includeInShortcutCycle: false, commandMode: .auto),
-        InputSource(name: "DisplayPort 2", value: 16, icon: "cable.connector.horizontal", nickname: "", includeInShortcutCycle: false, commandMode: .auto),
-        InputSource(name: "HDMI 1", value: 17, icon: "tv", nickname: "", includeInShortcutCycle: false, commandMode: .auto),
-        InputSource(name: "HDMI 2", value: 18, icon: "tv", nickname: "", includeInShortcutCycle: false, commandMode: .auto),
-        InputSource(name: "USB-C", value: 27, icon: "cable.connector", nickname: "", includeInShortcutCycle: false, commandMode: .auto)
-    ]
+    var inputs: [InputSource] = InputSource.builtInDefaults
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let savedInputs = loadInputs() {
@@ -1636,6 +1692,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateManager.startAutomaticChecks()
         refreshDisplayCache { [weak self] in
             guard let self else { return }
+            self.applyPresetIfNoSavedInputs()
             self.refreshCurrentInput()
             self.refreshMonitorLocation(forceBroadcast: true)
             self.requestPeerStatus()
@@ -1644,6 +1701,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func screenParametersDidChange() {
         refreshDisplayCache { [weak self] in
+            self?.applyPresetIfNoSavedInputs()
             self?.refreshMonitorLocation(forceBroadcast: false)
         }
     }
@@ -1665,6 +1723,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 completions.forEach { $0() }
             }
         }
+    }
+
+    // First run only: no input list was ever saved, so nothing of the user's gets overwritten.
+    func applyPresetIfNoSavedInputs() {
+        guard loadInputs() == nil,
+              let title = selectedDisplayTitle(),
+              let preset = DisplayPreset.match(displayTitle: title) else { return }
+        inputs = preset.applied(to: inputs)
+        saveInputs(inputs)
+        logDiagnostics("Preset applied automatically (no saved inputs): preset=\(preset.name) display=\(title)")
+        buildMenu()
     }
 
     func setupStatusItem() {
@@ -2744,6 +2813,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 extension AppDelegate: SettingsDelegate {
     func didSaveSettings(inputs: [InputSource], shortcutConfig: ShortcutConfig?, displayIndex: Int, displayTitle: String) {
         logDiagnostics("Settings saved: displayTitle=\(displayTitle) displayIndex=\(displayIndex) inputs=\(inputs.map { "\($0.name)=\($0.commandMode.rawValue):\($0.value)" }.joined(separator: ","))")
+        var inputs = inputs
+        let displayChanged = normalizedDisplayIdentity(selectedDisplayTitleValue) != normalizedDisplayIdentity(displayTitle)
+        if displayChanged,
+           InputSource.matchesBuiltInDefaults(inputs),
+           let preset = DisplayPreset.match(displayTitle: displayTitle) {
+            inputs = preset.applied(to: inputs)
+            logDiagnostics("Preset applied automatically (new display, default list): preset=\(preset.name) display=\(displayTitle)")
+        }
         self.inputs = inputs
         self.shortcutConfig = shortcutConfig
         self.selectedDisplayIndex = displayIndex
@@ -3248,6 +3325,7 @@ class SettingsWindowController: NSWindowController {
     var displayPopup: NSPopUpButton!
     var discoverButton: NSButton!
     var activeInputHint: Int?
+    var presetButton: NSButton!
 
     init(inputs: [InputSource], shortcutConfig: ShortcutConfig?, selectedDisplayIndex: Int, selectedDisplayTitle: String?, displays: [DisplayOption]) {
         self.inputs = inputs
@@ -3373,7 +3451,9 @@ class SettingsWindowController: NSWindowController {
         let displayTitle = makeLabel(loc("Monitör", "Display"), frame: NSRect(x: 20, y: 146, width: 120, height: 18))
         contentView.addSubview(displayTitle)
 
-        displayPopup = NSPopUpButton(frame: NSRect(x: 90, y: 140, width: 500, height: 28), pullsDown: false)
+        displayPopup = NSPopUpButton(frame: NSRect(x: 90, y: 140, width: 370, height: 28), pullsDown: false)
+        displayPopup.target = self
+        displayPopup.action = #selector(displaySelectionChanged)
         for display in displays {
             displayPopup.addItem(withTitle: "[\(display.index)] \(display.title)")
         }
@@ -3389,7 +3469,14 @@ class SettingsWindowController: NSWindowController {
         }
         contentView.addSubview(displayPopup)
 
-        discoverButton = NSButton(frame: NSRect(x: 610, y: 140, width: 160, height: 28))
+        presetButton = NSButton(frame: NSRect(x: 468, y: 140, width: 180, height: 28))
+        presetButton.bezelStyle = .rounded
+        presetButton.target = self
+        presetButton.action = #selector(loadPreset)
+        presetButton.toolTip = loc("Bu monitör modeli için bilinen port değerlerini ve komutlarını yükler. Kaydet'e basana kadar kalıcı olmaz.", "Loads the known port values and commands for this display model. Not saved until you press Save.")
+        contentView.addSubview(presetButton)
+
+        discoverButton = NSButton(frame: NSRect(x: 656, y: 140, width: 150, height: 28))
         discoverButton.title = loc("Input Keşfet...", "Discover Inputs...")
         discoverButton.bezelStyle = .rounded
         discoverButton.target = self
@@ -3397,7 +3484,7 @@ class SettingsWindowController: NSWindowController {
         discoverButton.toolTip = loc("Yaygın input/input-alt değerlerini sırayla dener, her denemeden sonra ne gördüğünü sorar ve bulunan değerleri listeye uygular.", "Tries common input/input-alt values one by one, asks what you saw after each try, and can apply the findings to the list.")
         contentView.addSubview(discoverButton)
 
-        let diagnosticsButton = NSButton(frame: NSRect(x: 780, y: 140, width: 140, height: 28))
+        let diagnosticsButton = NSButton(frame: NSRect(x: 814, y: 140, width: 146, height: 28))
         diagnosticsButton.title = loc("Günlüğü Aç", "Open Log")
         diagnosticsButton.bezelStyle = .rounded
         diagnosticsButton.target = self
@@ -3445,6 +3532,44 @@ class SettingsWindowController: NSWindowController {
         contentView.addSubview(saveButton)
 
         updateShortcutUI(message: nil)
+        updatePresetButton()
+    }
+
+    func updatePresetButton() {
+        let preset = DisplayPreset.match(displayTitle: selectedDisplayOption()?.title)
+        presetButton.isHidden = preset == nil
+        presetButton.title = preset.map { loc("Ön ayarı yükle: \($0.name)", "Load preset: \($0.name)") } ?? ""
+    }
+
+    @objc func displaySelectionChanged() {
+        updatePresetButton()
+    }
+
+    @objc func loadPreset() {
+        guard let display = selectedDisplayOption(),
+              let preset = DisplayPreset.match(displayTitle: display.title) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = loc("\(preset.name) ön ayarı yüklensin mi?", "Load the \(preset.name) preset?")
+        alert.informativeText = loc(
+            "Port değerleri ve komutlar değişir; takma adlar, döngü işaretleri ve kısayollar korunur. Kaydet'e basana kadar kalıcı olmaz.",
+            "This replaces port values and commands; nicknames, cycle flags and hotkeys are kept. Nothing is saved until you press Save."
+        )
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: loc("Yükle", "Load"))
+        alert.addButton(withTitle: loc("İptal", "Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let current = rows.indices.compactMap { inputSourceForRow($0) }
+        inputs = preset.applied(to: current)
+        selectedDisplayIndex = display.index
+        selectedDisplayTitle = display.title
+        logDiagnostics("Preset loaded in settings: preset=\(preset.name) display=\(display.title)")
+
+        // Rows are fixed at build time, so rebuild the whole content view.
+        window?.contentView?.subviews.forEach { $0.removeFromSuperview() }
+        buildUI()
+        shortcutHelpLabel.stringValue = loc("Ön ayar yüklendi. Kalıcı olması için Kaydet'e bas.", "Preset loaded. Press Save to keep it.")
     }
 
     func updateShortcutUI(message: String?) {
@@ -3524,6 +3649,7 @@ class SettingsWindowController: NSWindowController {
 
     func setTestingUIEnabled(_ isEnabled: Bool) {
         discoverButton.isEnabled = isEnabled
+        presetButton.isEnabled = isEnabled
         for row in rows {
             row.testButton.isEnabled = isEnabled
         }
