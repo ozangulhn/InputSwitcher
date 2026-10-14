@@ -89,6 +89,59 @@ struct DiscoveryProbe {
     let source: InputSource
 }
 
+// MARK: - Localization
+
+enum AppLanguage: String, CaseIterable {
+    case system
+    case turkish = "tr"
+    case english = "en"
+
+    var title: String {
+        switch self {
+        case .system:
+            return loc("Sistem", "System")
+        case .turkish:
+            return "Türkçe"
+        case .english:
+            return "English"
+        }
+    }
+
+    static var current: AppLanguage {
+        get {
+            UserDefaults.standard.string(forKey: "appLanguage").flatMap(AppLanguage.init(rawValue:)) ?? .system
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: "appLanguage")
+            resolvedIsTurkish = nil
+        }
+    }
+
+    private static var resolvedIsTurkish: Bool?
+
+    static var isTurkish: Bool {
+        if let resolvedIsTurkish {
+            return resolvedIsTurkish
+        }
+
+        let value: Bool
+        switch current {
+        case .turkish:
+            value = true
+        case .english:
+            value = false
+        case .system:
+            value = Locale.preferredLanguages.first?.lowercased().hasPrefix("tr") ?? false
+        }
+        resolvedIsTurkish = value
+        return value
+    }
+}
+
+func loc(_ turkish: String, _ english: String) -> String {
+    AppLanguage.isTurkish ? turkish : english
+}
+
 // MARK: - Diagnostics
 
 extension Notification.Name {
@@ -441,7 +494,7 @@ class DDCController {
     static func setInput(_ source: InputSource, displayIndex: Int = 1, displayTitle: String? = nil) -> ShellResult {
         guard let m1ddcPath = resolvedM1ddcPath() else {
             logDiagnostics("DDC setInput failed: m1ddc missing")
-            return ShellResult(status: 1, output: "m1ddc bulunamadı. Homebrew yolu veya PATH kontrol edilmeli.")
+            return ShellResult(status: 1, output: loc("m1ddc bulunamadı. Homebrew yolu veya PATH kontrol edilmeli.", "m1ddc not found. Check the Homebrew path or PATH."))
         }
         let resolvedMode = resolvedCommandMode(source.commandMode, displayTitle: displayTitle)
         let commandName = resolvedMode.commandName
@@ -704,20 +757,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         if !DDCController.isM1ddcAvailable() {
-            let warnItem = NSMenuItem(title: "⚠️  m1ddc bulunamadı", action: nil, keyEquivalent: "")
+            let warnItem = NSMenuItem(title: loc("⚠️  m1ddc bulunamadı", "⚠️  m1ddc not found"), action: nil, keyEquivalent: "")
             warnItem.isEnabled = false
             menu.addItem(warnItem)
 
-            let installItem = NSMenuItem(title: "Kurulum talimatlarını göster", action: #selector(showInstallInstructions), keyEquivalent: "")
+            let installItem = NSMenuItem(title: loc("Kurulum talimatlarını göster", "Show install instructions"), action: #selector(showInstallInstructions), keyEquivalent: "")
             installItem.target = self
             menu.addItem(installItem)
 
             menu.addItem(.separator())
         } else {
-            let sectionLabel = NSMenuItem(title: "INPUT KAYNAĞINI SEÇ", action: nil, keyEquivalent: "")
+            let sectionLabel = NSMenuItem(title: loc("INPUT KAYNAĞINI SEÇ", "SELECT INPUT SOURCE"), action: nil, keyEquivalent: "")
             sectionLabel.isEnabled = false
             sectionLabel.attributedTitle = NSAttributedString(
-                string: "INPUT KAYNAĞINI SEÇ",
+                string: loc("INPUT KAYNAĞINI SEÇ", "SELECT INPUT SOURCE"),
                 attributes: [
                     .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
                     .foregroundColor: NSColor.secondaryLabelColor
@@ -725,7 +778,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
             menu.addItem(sectionLabel)
 
-            let displayName = selectedDisplayTitle() ?? "Monitör \(selectedDisplayIndex)"
+            let displayName = selectedDisplayTitle() ?? loc("Monitör \(selectedDisplayIndex)", "Display \(selectedDisplayIndex)")
             let displayLabel = NSMenuItem(title: displayName, action: nil, keyEquivalent: "")
             displayLabel.isEnabled = false
             displayLabel.attributedTitle = NSAttributedString(
@@ -760,7 +813,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             cycleItem.isEnabled = !shortcutCycleSources().isEmpty
             menu.addItem(cycleItem)
 
-            let refreshItem = NSMenuItem(title: "Mevcut Input'u Yenile", action: #selector(refreshCurrentInput), keyEquivalent: "r")
+            let refreshItem = NSMenuItem(title: loc("Mevcut Input'u Yenile", "Refresh Current Input"), action: #selector(refreshCurrentInput), keyEquivalent: "r")
             refreshItem.target = self
             refreshItem.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
             menu.addItem(refreshItem)
@@ -768,23 +821,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
         }
 
-        let settingsItem = NSMenuItem(title: "Input Listesini Düzenle...", action: #selector(openSettings), keyEquivalent: ",")
+        let settingsItem = NSMenuItem(title: loc("Input Listesini Düzenle...", "Edit Input List..."), action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         settingsItem.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: nil)
         menu.addItem(settingsItem)
 
-        let aboutItem = NSMenuItem(title: "Hakkında", action: #selector(showAbout), keyEquivalent: "")
+        let languageItem = NSMenuItem(title: loc("Dil", "Language"), action: nil, keyEquivalent: "")
+        languageItem.image = NSImage(systemSymbolName: "globe", accessibilityDescription: nil)
+        let languageMenu = NSMenu()
+        for language in AppLanguage.allCases {
+            let item = NSMenuItem(title: language.title, action: #selector(selectLanguage(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = language.rawValue
+            item.state = AppLanguage.current == language ? .on : .off
+            languageMenu.addItem(item)
+        }
+        languageItem.submenu = languageMenu
+        menu.addItem(languageItem)
+
+        let aboutItem = NSMenuItem(title: loc("Hakkında", "About"), action: #selector(showAbout), keyEquivalent: "")
         aboutItem.target = self
         menu.addItem(aboutItem)
 
-        let diagnosticsItem = NSMenuItem(title: "Tanılama Günlüğü", action: #selector(showDiagnostics), keyEquivalent: "")
+        let diagnosticsItem = NSMenuItem(title: loc("Tanılama Günlüğü", "Diagnostics Log"), action: #selector(showDiagnostics), keyEquivalent: "")
         diagnosticsItem.target = self
         diagnosticsItem.image = NSImage(systemSymbolName: "doc.text.magnifyingglass", accessibilityDescription: nil)
         menu.addItem(diagnosticsItem)
 
         menu.addItem(.separator())
 
-        let quitItem = NSMenuItem(title: "Çıkış", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: loc("Çıkış", "Quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quitItem.target = NSApp
         menu.addItem(quitItem)
 
@@ -815,14 +881,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         sublabel.backgroundColor = .clear
 
         if let currentSource = displayedCurrentSource() {
-            let prefix = isResolvedFromDetectedInput(currentSource) ? "Aktif" : "Son seçilen"
+            let prefix = isResolvedFromDetectedInput(currentSource) ? loc("Aktif", "Active") : loc("Son seçilen", "Last selected")
             sublabel.stringValue = "\(prefix): \(currentSource.menuLabel)"
             sublabel.textColor = .controlAccentColor
         } else if let currentInputValue {
-            sublabel.stringValue = "Aktif: Input \(currentInputValue)"
+            sublabel.stringValue = loc("Aktif: Input \(currentInputValue)", "Active: Input \(currentInputValue)")
             sublabel.textColor = .secondaryLabelColor
         } else {
-            sublabel.stringValue = "Aktif input bilinmiyor"
+            sublabel.stringValue = loc("Aktif input bilinmiyor", "Active input unknown")
             sublabel.textColor = .secondaryLabelColor
         }
 
@@ -896,14 +962,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func cycleMenuTitle() -> String {
         guard !shortcutCycleSources().isEmpty else {
-            return "Kısayol için input seç"
+            return loc("Kısayol için input seç", "Select inputs for the shortcut")
         }
 
         if let shortcutConfig {
-            return "Seçili inputlar arasında geç (\(shortcutConfig.displayString))"
+            return loc("Seçili inputlar arasında geç (\(shortcutConfig.displayString))", "Cycle selected inputs (\(shortcutConfig.displayString))")
         }
 
-        return "Seçili inputlar arasında geç"
+        return loc("Seçili inputlar arasında geç", "Cycle selected inputs")
     }
 
     func shortcutCycleSources() -> [InputSource] {
@@ -934,7 +1000,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     logDiagnostics("Switch rerouted: selected display not local on \(self.instanceName)")
                     self.handleLocalSwitchFailure(
                         targetInputValue: value,
-                        commandOutput: "Seçili monitör bu Mac'te bağlı görünmüyor."
+                        commandOutput: "",
+                        displayMissing: true
                     )
                 }
                 return
@@ -1073,6 +1140,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         switchToInputValue(value)
     }
 
+    @objc func selectLanguage(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let language = AppLanguage(rawValue: rawValue) else { return }
+        AppLanguage.current = language
+        logDiagnostics("Language changed: \(language.rawValue)")
+        settingsWindowController?.close()
+        settingsWindowController = nil
+        aboutWindowController?.close()
+        aboutWindowController = nil
+        diagnosticsWindowController?.close()
+        diagnosticsWindowController = nil
+        buildMenu()
+    }
+
     @objc func cycleShortcutInputsFromMenu() {
         triggerShortcutCycle()
     }
@@ -1097,20 +1178,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showInstallInstructions() {
         let alert = NSAlert()
-        alert.messageText = "m1ddc Kurulumu"
-        alert.informativeText = """
-        m1ddc'yi kurmak için Terminal'de şunu çalıştırın:
-
+        alert.messageText = loc("m1ddc Kurulumu", "Installing m1ddc")
+        let installCommands = """
         git clone https://github.com/waydabber/m1ddc
         cd m1ddc
         make
         sudo cp m1ddc /usr/local/bin/
-
-        Kurulumdan sonra bu uygulamayı yeniden başlatın.
         """
+        alert.informativeText = loc(
+            "m1ddc'yi kurmak için Terminal'de şunu çalıştırın:\n\n\(installCommands)\n\nKurulumdan sonra bu uygulamayı yeniden başlatın.",
+            "To install m1ddc, run this in Terminal:\n\n\(installCommands)\n\nRestart this app after installing."
+        )
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "Tamam")
-        alert.addButton(withTitle: "Komutu Kopyala")
+        alert.addButton(withTitle: loc("Tamam", "OK"))
+        alert.addButton(withTitle: loc("Komutu Kopyala", "Copy Command"))
 
         let response = alert.runModal()
         if response == .alertSecondButtonReturn {
@@ -1164,7 +1245,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showNotification(inputName: String) {
-        statusItem.button?.toolTip = "Aktif: \(inputName)"
+        statusItem.button?.toolTip = loc("Aktif: \(inputName)", "Active: \(inputName)")
     }
 
     func restoreStatusIcon() {
@@ -1179,7 +1260,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = title
         alert.informativeText = message
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Tamam")
+        alert.addButton(withTitle: loc("Tamam", "OK"))
         alert.runModal()
     }
 
@@ -1204,18 +1285,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         currentDisplayOption()?.index
     }
 
-    func handleLocalSwitchFailure(targetInputValue: Int, commandOutput: String) {
+    func handleLocalSwitchFailure(targetInputValue: Int, commandOutput: String, displayMissing: Bool = false) {
         let trimmedOutput = commandOutput.trimmingCharacters(in: .whitespacesAndNewlines)
         logDiagnostics("Handle local switch failure: input=\(targetInputValue) output=\(trimmedOutput.isEmpty ? "-" : trimmedOutput)")
-        if trimmedOutput.localizedCaseInsensitiveContains("display does not exist") ||
-            trimmedOutput.localizedCaseInsensitiveContains("bağlı görünmüyor") {
+        if displayMissing || trimmedOutput.localizedCaseInsensitiveContains("display does not exist") {
             requestRemoteSwitch(targetInputValue: targetInputValue)
             return
         }
 
         showCommandError(
-            title: "Input değiştirilemedi",
-            message: trimmedOutput.isEmpty ? "m1ddc komutu başarısız oldu." : trimmedOutput
+            title: loc("Input değiştirilemedi", "Could not switch input"),
+            message: trimmedOutput.isEmpty ? loc("m1ddc komutu başarısız oldu.", "The m1ddc command failed.") : trimmedOutput
         )
     }
 
@@ -1253,26 +1333,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func monitorLocationText() -> String {
         if currentDisplayOption() != nil {
-            return "Monitör: Bu Mac"
+            return loc("Monitör: Bu Mac", "Display: This Mac")
         }
 
         if let knownMonitorOwnerName {
-            return "Monitör: \(knownMonitorOwnerName)"
+            return loc("Monitör: \(knownMonitorOwnerName)", "Display: \(knownMonitorOwnerName)")
         }
 
-        return "Monitör: Ağda aranıyor"
+        return loc("Monitör: Ağda aranıyor", "Display: Searching network")
     }
 
     func requestRemoteSwitch(targetInputValue: Int) {
         guard let selectedDisplayTitle = selectedDisplayTitle() else {
             logDiagnostics("Remote switch aborted: no selected display title")
-            showCommandError(title: "Uzak geçiş yapılamadı", message: "Önce hedef monitörü seç.")
+            showCommandError(title: loc("Uzak geçiş yapılamadı", "Remote switch failed"), message: loc("Önce hedef monitörü seç.", "Select the target display first."))
             return
         }
 
         guard let peerManager, peerManager.hasPeers() else {
             logDiagnostics("Remote switch aborted: no peers available")
-            showCommandError(title: "Uzak geçiş yapılamadı", message: "Yerel ağda başka Input Switcher bulunamadı.")
+            showCommandError(title: loc("Uzak geçiş yapılamadı", "Remote switch failed"), message: loc("Yerel ağda başka Input Switcher bulunamadı.", "No other Input Switcher found on the local network."))
             return
         }
 
@@ -1291,7 +1371,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         let inputName = inputs.first(where: { $0.value == targetInputValue })?.menuLabel ?? "Input \(targetInputValue)"
-        statusItem.button?.toolTip = "Uzak isteği gönderildi: \(inputName)"
+        statusItem.button?.toolTip = loc("Uzak isteği gönderildi: \(inputName)", "Remote request sent: \(inputName)")
     }
 
     func requestPeerStatus() {
@@ -1521,14 +1601,14 @@ class ShortcutRecorderButton: NSButton {
 
         if event.keyCode == 53 {
             isRecordingShortcut = false
-            statusHandler?("Kısayol kaydı iptal edildi.")
+            statusHandler?(loc("Kısayol kaydı iptal edildi.", "Shortcut recording cancelled."))
             return
         }
 
         if event.keyCode == 51 || event.keyCode == 117 {
             shortcutConfig = nil
             isRecordingShortcut = false
-            statusHandler?("Kısayol temizlendi.")
+            statusHandler?(loc("Kısayol temizlendi.", "Shortcut cleared."))
             return
         }
 
@@ -1540,7 +1620,7 @@ class ShortcutRecorderButton: NSButton {
         let requiredModifiers = modifiers.intersection([.command, .control, .option])
 
         guard !requiredModifiers.isEmpty else {
-            statusHandler?("En az bir Cmd, Ctrl veya Option kullan.")
+            statusHandler?(loc("En az bir Cmd, Ctrl veya Option kullan.", "Use at least one of Cmd, Ctrl or Option."))
             return
         }
 
@@ -1549,14 +1629,14 @@ class ShortcutRecorderButton: NSButton {
             carbonModifiers: carbonModifiers(from: modifiers)
         )
         isRecordingShortcut = false
-        statusHandler?("Kaydedilecek kısayol: \(shortcutConfig?.displayString ?? "")")
+        statusHandler?(loc("Kaydedilecek kısayol: \(shortcutConfig?.displayString ?? "")", "Shortcut to save: \(shortcutConfig?.displayString ?? "")"))
     }
 
     override func resignFirstResponder() -> Bool {
         let didResign = super.resignFirstResponder()
         if didResign && isRecordingShortcut {
             isRecordingShortcut = false
-            statusHandler?("Kısayol kaydı iptal edildi.")
+            statusHandler?(loc("Kısayol kaydı iptal edildi.", "Shortcut recording cancelled."))
         }
         return didResign
     }
@@ -1564,17 +1644,17 @@ class ShortcutRecorderButton: NSButton {
     func beginRecording() {
         isRecordingShortcut = true
         window?.makeFirstResponder(self)
-        statusHandler?("Kısayol kombinasyonuna bas. Esc iptal eder, Delete temizler.")
+        statusHandler?(loc("Kısayol kombinasyonuna bas. Esc iptal eder, Delete temizler.", "Press a key combination. Esc cancels, Delete clears."))
     }
 
     func clearShortcut() {
         shortcutConfig = nil
         isRecordingShortcut = false
-        statusHandler?("Kısayol temizlendi.")
+        statusHandler?(loc("Kısayol temizlendi.", "Shortcut cleared."))
     }
 
     func updateAppearance() {
-        title = isRecordingShortcut ? "Kısayola Bas..." : (shortcutConfig?.displayString ?? "Kısayol Kaydet")
+        title = isRecordingShortcut ? loc("Kısayola Bas...", "Press Shortcut...") : (shortcutConfig?.displayString ?? loc("Kısayol Kaydet", "Record Shortcut"))
     }
 }
 
@@ -1592,7 +1672,7 @@ class DiagnosticsWindowController: NSWindowController {
             defer: false
         )
 
-        window.title = "Tanılama Günlüğü"
+        window.title = loc("Tanılama Günlüğü", "Diagnostics Log")
         window.center()
         super.init(window: window)
         buildUI()
@@ -1633,21 +1713,21 @@ class DiagnosticsWindowController: NSWindowController {
         scrollView.documentView = textView
         contentView.addSubview(scrollView)
 
-        let helpLabel = NSTextField(wrappingLabelWithString: "Copy All ile tüm günlük çıktısını kopyalayıp buraya yapıştırabilirsin.")
+        let helpLabel = NSTextField(wrappingLabelWithString: loc("Copy All ile tüm günlük çıktısını kopyalayıp paylaşabilirsin.", "Use Copy All to copy the whole log and share it."))
         helpLabel.frame = NSRect(x: 20, y: 22, width: 380, height: 28)
         helpLabel.font = NSFont.systemFont(ofSize: 11)
         helpLabel.textColor = .secondaryLabelColor
         contentView.addSubview(helpLabel)
 
         let refreshButton = NSButton(frame: NSRect(x: 490, y: 18, width: 80, height: 28))
-        refreshButton.title = "Yenile"
+        refreshButton.title = loc("Yenile", "Refresh")
         refreshButton.bezelStyle = .rounded
         refreshButton.target = self
         refreshButton.action = #selector(refreshAction)
         contentView.addSubview(refreshButton)
 
         let clearButton = NSButton(frame: NSRect(x: 576, y: 18, width: 80, height: 28))
-        clearButton.title = "Temizle"
+        clearButton.title = loc("Temizle", "Clear")
         clearButton.bezelStyle = .rounded
         clearButton.target = self
         clearButton.action = #selector(clearAction)
@@ -1691,7 +1771,7 @@ class AboutWindowController: NSWindowController {
             defer: false
         )
 
-        window.title = "Input Switcher Hakkında"
+        window.title = loc("Input Switcher Hakkında", "About Input Switcher")
         window.center()
         super.init(window: window)
         buildUI()
@@ -1712,11 +1792,11 @@ class AboutWindowController: NSWindowController {
         let titleLabel = makeLabel("Input Switcher", frame: NSRect(x: 76, y: 224, width: 260, height: 22), fontSize: 20, weight: .semibold, color: .labelColor)
         contentView.addSubview(titleLabel)
 
-        let versionLabel = makeLabel("Sürüm \(appVersionString())", frame: NSRect(x: 76, y: 202, width: 260, height: 18), fontSize: 12, weight: .medium, color: .secondaryLabelColor)
+        let versionLabel = makeLabel(loc("Sürüm \(appVersionString())", "Version \(appVersionString())"), frame: NSRect(x: 76, y: 202, width: 260, height: 18), fontSize: 12, weight: .medium, color: .secondaryLabelColor)
         contentView.addSubview(versionLabel)
 
         let descriptionLabel = makeWrappingLabel(
-            "Apple Silicon Mac üzerinde m1ddc ile çalışan menü bar monitör input değiştirici.",
+            loc("Apple Silicon Mac üzerinde m1ddc ile çalışan menü bar monitör input değiştirici.", "A menu bar display input switcher for Apple Silicon Macs, powered by m1ddc."),
             frame: NSRect(x: 24, y: 146, width: 372, height: 42),
             fontSize: 13,
             color: .labelColor
@@ -1724,14 +1804,14 @@ class AboutWindowController: NSWindowController {
         contentView.addSubview(descriptionLabel)
 
         let noteLabel = makeWrappingLabel(
-            "İki yönlü geçiş için uygulamayı iki Mac'e de kur. Bir Mac monitörden ayrıldıktan sonra o Mac geri dönüş komutu gönderemez.",
+            loc("İki yönlü geçiş için uygulamayı iki Mac'e de kur. Bir Mac monitörden ayrıldıktan sonra o Mac geri dönüş komutu gönderemez.", "Install the app on both Macs to switch both ways. Once a Mac leaves the display, it can only switch back through the other Mac."),
             frame: NSRect(x: 24, y: 96, width: 372, height: 38),
             fontSize: 12,
             color: .secondaryLabelColor
         )
         contentView.addSubview(noteLabel)
 
-        let pathTitleLabel = makeLabel("Kurulum Yolu", frame: NSRect(x: 24, y: 68, width: 100, height: 18), fontSize: 11, weight: .medium, color: .secondaryLabelColor)
+        let pathTitleLabel = makeLabel(loc("Kurulum Yolu", "Install Path"), frame: NSRect(x: 24, y: 68, width: 100, height: 18), fontSize: 11, weight: .medium, color: .secondaryLabelColor)
         contentView.addSubview(pathTitleLabel)
 
         let pathLabel = makeWrappingLabel(
@@ -1743,7 +1823,7 @@ class AboutWindowController: NSWindowController {
         contentView.addSubview(pathLabel)
 
         let closeButton = NSButton(frame: NSRect(x: 316, y: 8, width: 80, height: 28))
-        closeButton.title = "Tamam"
+        closeButton.title = loc("Tamam", "OK")
         closeButton.bezelStyle = .rounded
         closeButton.target = self
         closeButton.action = #selector(closeWindow)
@@ -1806,7 +1886,7 @@ class SettingsWindowController: NSWindowController {
             defer: false
         )
 
-        window.title = "Input Listesini Düzenle"
+        window.title = loc("Input Listesini Düzenle", "Edit Input List")
         window.center()
 
         super.init(window: window)
@@ -1828,11 +1908,11 @@ class SettingsWindowController: NSWindowController {
         let tableContainer = NSView(frame: NSRect(x: 0, y: 0, width: 940, height: containerHeight))
 
         tableContainer.addSubview(makeLabel("PORT", frame: NSRect(x: 10, y: CGFloat(containerHeight - 26), width: 150, height: 18), small: true))
-        tableContainer.addSubview(makeLabel("NICKNAME", frame: NSRect(x: 170, y: CGFloat(containerHeight - 26), width: 180, height: 18), small: true))
-        tableContainer.addSubview(makeLabel("DDC DEĞERİ", frame: NSRect(x: 360, y: CGFloat(containerHeight - 26), width: 100, height: 18), small: true))
-        tableContainer.addSubview(makeLabel("DDC KOMUTU", frame: NSRect(x: 470, y: CGFloat(containerHeight - 26), width: 170, height: 18), small: true))
+        tableContainer.addSubview(makeLabel(loc("TAKMA AD", "NICKNAME"), frame: NSRect(x: 170, y: CGFloat(containerHeight - 26), width: 180, height: 18), small: true))
+        tableContainer.addSubview(makeLabel(loc("DDC DEĞERİ", "DDC VALUE"), frame: NSRect(x: 360, y: CGFloat(containerHeight - 26), width: 100, height: 18), small: true))
+        tableContainer.addSubview(makeLabel(loc("DDC KOMUTU", "DDC COMMAND"), frame: NSRect(x: 470, y: CGFloat(containerHeight - 26), width: 170, height: 18), small: true))
         tableContainer.addSubview(makeLabel("TEST", frame: NSRect(x: 680, y: CGFloat(containerHeight - 26), width: 60, height: 18), small: true))
-        tableContainer.addSubview(makeLabel("KISAYOLDA", frame: NSRect(x: 770, y: CGFloat(containerHeight - 26), width: 90, height: 18), small: true))
+        tableContainer.addSubview(makeLabel(loc("DÖNGÜDE", "IN CYCLE"), frame: NSRect(x: 770, y: CGFloat(containerHeight - 26), width: 90, height: 18), small: true))
 
         rows = []
 
@@ -1841,12 +1921,12 @@ class SettingsWindowController: NSWindowController {
 
             let nameField = NSTextField(frame: NSRect(x: 10, y: y, width: 150, height: 28))
             nameField.stringValue = input.name
-            nameField.placeholderString = "Örn. HDMI 1"
+            nameField.placeholderString = loc("Örn. HDMI 1", "e.g. HDMI 1")
             tableContainer.addSubview(nameField)
 
             let nicknameField = NSTextField(frame: NSRect(x: 170, y: y, width: 180, height: 28))
             nicknameField.stringValue = input.trimmedNickname
-            nicknameField.placeholderString = "Örn. İş laptopu"
+            nicknameField.placeholderString = loc("Örn. İş laptopu", "e.g. Work laptop")
             tableContainer.addSubview(nicknameField)
 
             let valueField = NSTextField(frame: NSRect(x: 360, y: y, width: 80, height: 28))
@@ -1861,7 +1941,7 @@ class SettingsWindowController: NSWindowController {
             if let index = InputCommandMode.allCases.firstIndex(of: input.commandMode) {
                 commandModePopup.selectItem(at: index)
             }
-            commandModePopup.toolTip = "Bu input için hangi DDC komutu gönderilsin: input veya input-alt."
+            commandModePopup.toolTip = loc("Bu input için hangi DDC komutu gönderilsin: input veya input-alt.", "Which DDC command to send for this input: input or input-alt.")
             tableContainer.addSubview(commandModePopup)
 
             let testButton = NSButton(frame: NSRect(x: 670, y: y, width: 74, height: 28))
@@ -1870,7 +1950,7 @@ class SettingsWindowController: NSWindowController {
             testButton.target = self
             testButton.action = #selector(testInputRow(_:))
             testButton.tag = index
-            testButton.toolTip = "Bu satırdaki DDC değerini ve komutu hemen dene."
+            testButton.toolTip = loc("Bu satırdaki DDC değerini ve komutu hemen dene.", "Try this row's DDC value and command now.")
             tableContainer.addSubview(testButton)
 
             let shortcutToggle = NSButton(checkboxWithTitle: "", target: nil, action: nil)
@@ -1894,13 +1974,13 @@ class SettingsWindowController: NSWindowController {
         contentView.addSubview(scrollView)
 
         let infoLabel = makeLabel(
-            "Her input için ham DDC değeri ve DDC komutunu ayrı ayarlayabilirsin. LG monitörlerde HDMI/USB-C için genelde input-alt gerekir.",
+            loc("Her input için ham DDC değeri ve DDC komutunu ayrı ayarlayabilirsin. LG monitörlerde HDMI/USB-C için genelde input-alt gerekir.", "Set the raw DDC value and DDC command per input. LG displays usually need input-alt for HDMI/USB-C."),
             frame: NSRect(x: 20, y: 174, width: 940, height: 18),
             small: true
         )
         contentView.addSubview(infoLabel)
 
-        let displayTitle = makeLabel("Monitör", frame: NSRect(x: 20, y: 146, width: 120, height: 18))
+        let displayTitle = makeLabel(loc("Monitör", "Display"), frame: NSRect(x: 20, y: 146, width: 120, height: 18))
         contentView.addSubview(displayTitle)
 
         displayPopup = NSPopUpButton(frame: NSRect(x: 90, y: 140, width: 500, height: 28), pullsDown: false)
@@ -1920,21 +2000,21 @@ class SettingsWindowController: NSWindowController {
         contentView.addSubview(displayPopup)
 
         discoverButton = NSButton(frame: NSRect(x: 610, y: 140, width: 160, height: 28))
-        discoverButton.title = "Input Keşfet..."
+        discoverButton.title = loc("Input Keşfet...", "Discover Inputs...")
         discoverButton.bezelStyle = .rounded
         discoverButton.target = self
         discoverButton.action = #selector(discoverInputs)
-        discoverButton.toolTip = "Seçili monitörde yaygın input/input-alt değerlerini sırayla dener ve günlüğe yazar."
+        discoverButton.toolTip = loc("Seçili monitörde yaygın input/input-alt değerlerini sırayla dener ve günlüğe yazar.", "Tries common input/input-alt values on the selected display and logs the results.")
         contentView.addSubview(discoverButton)
 
         let diagnosticsButton = NSButton(frame: NSRect(x: 780, y: 140, width: 140, height: 28))
-        diagnosticsButton.title = "Günlüğü Aç"
+        diagnosticsButton.title = loc("Günlüğü Aç", "Open Log")
         diagnosticsButton.bezelStyle = .rounded
         diagnosticsButton.target = self
         diagnosticsButton.action = #selector(openDiagnosticsFromSettings)
         contentView.addSubview(diagnosticsButton)
 
-        let shortcutTitle = makeLabel("Kısayol", frame: NSRect(x: 20, y: 76, width: 120, height: 18))
+        let shortcutTitle = makeLabel(loc("Döngü Kısayolu", "Cycle Shortcut"), frame: NSRect(x: 20, y: 76, width: 120, height: 18))
         contentView.addSubview(shortcutTitle)
 
         shortcutValueLabel = makeLabel("", frame: NSRect(x: 20, y: 52, width: 340, height: 18))
@@ -1953,21 +2033,21 @@ class SettingsWindowController: NSWindowController {
         contentView.addSubview(shortcutRecordButton)
 
         shortcutClearButton = NSButton(frame: NSRect(x: 780, y: 46, width: 100, height: 30))
-        shortcutClearButton.title = "Temizle"
+        shortcutClearButton.title = loc("Temizle", "Clear")
         shortcutClearButton.bezelStyle = .rounded
         shortcutClearButton.target = self
         shortcutClearButton.action = #selector(clearShortcut)
         contentView.addSubview(shortcutClearButton)
 
         let cancelButton = NSButton(frame: NSRect(x: 716, y: 8, width: 80, height: 30))
-        cancelButton.title = "İptal"
+        cancelButton.title = loc("İptal", "Cancel")
         cancelButton.bezelStyle = .rounded
         cancelButton.target = self
         cancelButton.action = #selector(cancel)
         contentView.addSubview(cancelButton)
 
         let saveButton = NSButton(frame: NSRect(x: 804, y: 8, width: 100, height: 30))
-        saveButton.title = "Kaydet"
+        saveButton.title = loc("Kaydet", "Save")
         saveButton.bezelStyle = .rounded
         saveButton.keyEquivalent = "\r"
         saveButton.target = self
@@ -1979,14 +2059,14 @@ class SettingsWindowController: NSWindowController {
 
     func updateShortcutUI(message: String?) {
         if shortcutRecordButton.isRecordingShortcut {
-            shortcutValueLabel.stringValue = "Kayıt bekleniyor..."
-            shortcutHelpLabel.stringValue = message ?? "Kısayol kombinasyonuna bas. Esc iptal eder, Delete temizler."
+            shortcutValueLabel.stringValue = loc("Kayıt bekleniyor...", "Waiting for shortcut...")
+            shortcutHelpLabel.stringValue = message ?? loc("Kısayol kombinasyonuna bas. Esc iptal eder, Delete temizler.", "Press a key combination. Esc cancels, Delete clears.")
             shortcutClearButton.isEnabled = false
             return
         }
 
-        shortcutValueLabel.stringValue = "Geçerli kısayol: \(shortcutConfig?.displayString ?? "Ayarlı değil")"
-        shortcutHelpLabel.stringValue = message ?? "Bu kısayol yalnızca 'Kısayolda' işaretli input'lar arasında döner."
+        shortcutValueLabel.stringValue = loc("Geçerli kısayol: \(shortcutConfig?.displayString ?? "Ayarlı değil")", "Current shortcut: \(shortcutConfig?.displayString ?? "Not set")")
+        shortcutHelpLabel.stringValue = message ?? loc("Bu kısayol yalnızca 'Döngüde' işaretli input'lar arasında döner.", "This shortcut cycles only through inputs marked 'In Cycle'.")
         shortcutClearButton.isEnabled = shortcutConfig != nil
     }
 
@@ -2038,7 +2118,7 @@ class SettingsWindowController: NSWindowController {
         alert.messageText = title
         alert.informativeText = message
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "Tamam")
+        alert.addButton(withTitle: loc("Tamam", "OK"))
         alert.runModal()
     }
 
@@ -2047,7 +2127,7 @@ class SettingsWindowController: NSWindowController {
         alert.messageText = title
         alert.informativeText = message
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Tamam")
+        alert.addButton(withTitle: loc("Tamam", "OK"))
         alert.runModal()
     }
 
@@ -2084,7 +2164,7 @@ class SettingsWindowController: NSWindowController {
     @objc func clearShortcut() {
         shortcutRecordButton.clearShortcut()
         shortcutConfig = nil
-        updateShortcutUI(message: "Kısayol temizlendi.")
+        updateShortcutUI(message: loc("Kısayol temizlendi.", "Shortcut cleared."))
     }
 
     @objc func openDiagnosticsFromSettings() {
@@ -2094,7 +2174,7 @@ class SettingsWindowController: NSWindowController {
     @objc func testInputRow(_ sender: NSButton) {
         guard let source = inputSourceForRow(sender.tag) else { return }
         guard let display = selectedDisplayOption() else {
-            presentWarningAlert(title: "Monitör seçilmedi", message: "Önce test edilecek monitörü seç.")
+            presentWarningAlert(title: loc("Monitör seçilmedi", "No display selected"), message: loc("Önce test edilecek monitörü seç.", "Select the display to test first."))
             return
         }
 
@@ -2107,27 +2187,27 @@ class SettingsWindowController: NSWindowController {
             let stillLocal = self.monitorStillLocal(display.title)
             let detectedValue = stillLocal ? DDCController.getCurrentInput(displayIndex: display.index) : nil
             let trimmedOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            let outcome = stillLocal ? "Monitör hâlâ bu Mac'te görünüyor." : "Monitör bu Mac'ten ayrıldı; komut input değiştirmiş olabilir."
+            let outcome = stillLocal ? loc("Monitör hâlâ bu Mac'te görünüyor.", "The display is still attached to this Mac.") : loc("Monitör bu Mac'ten ayrıldı; komut input değiştirmiş olabilir.", "The display left this Mac; the command probably switched the input.")
             logDiagnostics("Settings row test finished: display=\(display.title) input=\(source.menuLabel) status=\(result.status) stillLocal=\(stillLocal) detected=\(detectedValue.map(String.init) ?? "-")")
 
             DispatchQueue.main.async {
                 self.setTestingUIEnabled(true)
                 if result.status == 0 {
                     self.presentInfoAlert(
-                        title: "Test tamamlandı",
+                        title: loc("Test tamamlandı", "Test finished"),
                         message: """
                         \(source.menuLabel)
-                        Komut: \(source.commandMode.title) / \(source.value)
+                        \(loc("Komut", "Command")): \(source.commandMode.title) / \(source.value)
 
-                        Sonuç: \(outcome)
+                        \(loc("Sonuç", "Result")): \(outcome)
                         get input: \(detectedValue.map(String.init) ?? "-")
-                        Çıktı: \(trimmedOutput.isEmpty ? "Yok" : trimmedOutput)
+                        \(loc("Çıktı", "Output")): \(trimmedOutput.isEmpty ? "-" : trimmedOutput)
                         """
                     )
                 } else {
                     self.presentWarningAlert(
-                        title: "Test başarısız",
-                        message: trimmedOutput.isEmpty ? "m1ddc komutu başarısız oldu." : trimmedOutput
+                        title: loc("Test başarısız", "Test failed"),
+                        message: trimmedOutput.isEmpty ? loc("m1ddc komutu başarısız oldu.", "The m1ddc command failed.") : trimmedOutput
                     )
                 }
             }
