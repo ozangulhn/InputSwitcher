@@ -277,6 +277,8 @@ struct PeerMessage: Codable {
     let displayIdentity: String?
     let isDisplayLocal: Bool?
     let requestedInputValue: Int?
+    var currentInputValue: Int? = nil
+    var ownInputValue: Int? = nil
 }
 
 protocol PeerManagerDelegate: AnyObject {
@@ -665,6 +667,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var instanceID: String = UUID().uuidString
     let instanceName = localMachineName()
     var lastKnownLocalPresence: Bool?
+    var learnedMacNames: [Int: String] = [:]
+    var pendingLearnedInput: Int?
+    var lastSwitchDate = Date.distantPast
+    var monitorTimerTicks = 0
     var cachedDisplays: [DisplayOption] = []
     var displayCacheCompletions: [() -> Void] = []
     var isRefreshingDisplayCache = false
@@ -689,6 +695,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         selectedDisplayIndex = loadSelectedDisplayIndex()
         selectedDisplayTitleValue = loadSelectedDisplayTitle()
         instanceID = loadOrCreateInstanceID()
+        learnedMacNames = loadLearnedMacNames()
         logDiagnostics("App launch: name=\(instanceName) version=\(appVersionString()) displayTitle=\(selectedDisplayTitleValue ?? "-") displayIndex=\(selectedDisplayIndex)")
 
         setupStatusItem()
@@ -820,6 +827,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             refreshItem.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
             menu.addItem(refreshItem)
 
+            let ownerTitleItem = NSMenuItem(title: loc("Ekrandaki Mac'i Menü Çubuğunda Göster", "Show On-Screen Mac in Menu Bar"), action: #selector(toggleShowOwnerInMenuBar), keyEquivalent: "")
+            ownerTitleItem.target = self
+            ownerTitleItem.state = showOwnerInMenuBar ? .on : .off
+            menu.addItem(ownerTitleItem)
+
             menu.addItem(.separator())
         }
 
@@ -857,6 +869,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         statusItem.menu = menu
+        updateStatusButtonTitle()
     }
 
     func makeHeaderView() -> NSView {
@@ -907,7 +920,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         item.state = isCurrent ? .on : .off
         item.onStateImage = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil)
         item.attributedTitle = attributedTitle(for: source, isCurrent: isCurrent)
-        item.toolTip = source.trimmedNickname.isEmpty ? source.name : "\(source.name) - \(source.trimmedNickname)"
+        let nickname = effectiveNickname(for: source)
+        item.toolTip = nickname.isEmpty ? source.name : "\(source.name) - \(nickname)"
         return item
     }
 
@@ -920,10 +934,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ]
         )
 
-        if !source.trimmedNickname.isEmpty {
+        let nickname = effectiveNickname(for: source)
+        let isLearned = source.trimmedNickname.isEmpty && !nickname.isEmpty
+        if !nickname.isEmpty {
             title.append(
                 NSAttributedString(
-                    string: "  •  ",
+                    string: isLearned ? "  ◦  " : "  •  ",
                     attributes: [
                         .font: NSFont.systemFont(ofSize: 12),
                         .foregroundColor: isCurrent ? NSColor.controlAccentColor : NSColor.secondaryLabelColor
@@ -932,7 +948,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
             title.append(
                 NSAttributedString(
-                    string: source.trimmedNickname,
+                    string: nickname,
                     attributes: [
                         .font: NSFont.systemFont(ofSize: 12, weight: .medium),
                         .foregroundColor: isCurrent ? NSColor.controlAccentColor : NSColor.secondaryLabelColor
@@ -993,6 +1009,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func switchToInputValue(_ value: Int) {
         guard DDCController.isM1ddcAvailable() else { return }
         guard let source = inputs.first(where: { $0.value == value }) else { return }
+        lastSwitchDate = Date()
+        pendingLearnedInput = nil
         logDiagnostics("Switch requested: input=\(value) mode=\(source.commandMode.rawValue) label=\(source.menuLabel) localDisplay=\(currentDisplayIndex().map(String.init) ?? "-") selectedDisplay=\(selectedDisplayTitle() ?? "-")")
 
         if let button = statusItem.button {
@@ -1080,8 +1098,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         monitorStatusTimer?.invalidate()
         monitorStatusTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.refreshDisplayCache {
-                self?.refreshMonitorLocation(forceBroadcast: false)
-                self?.requestPeerStatus()
+                guard let self else { return }
+                self.refreshMonitorLocation(forceBroadcast: false)
+                self.requestPeerStatus()
+                self.monitorTimerTicks += 1
+                if self.monitorTimerTicks % 2 == 0 {
+                    self.sampleCurrentInputForLearning()
+                }
             }
         }
     }
@@ -1346,6 +1369,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if isLocal {
             knownMonitorOwnerName = instanceName
+        } else if knownMonitorOwnerName == instanceName {
+            knownMonitorOwnerName = lastSelectedInputValue
+                .flatMap { learnedMacNames[$0] }
+                .flatMap { $0 == instanceName ? nil : $0 }
         }
 
         if forceBroadcast || lastKnownLocalPresence != isLocal || previousOwnerName != knownMonitorOwnerName {
@@ -1357,28 +1384,125 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             buildMenu()
 
             if let selectedDisplayTitle = selectedDisplayTitle() {
-                peerManager?.broadcast(
-                    PeerMessage(
-                        type: "status",
-                        senderID: instanceID,
-                        senderName: instanceName,
-                        displayTitle: selectedDisplayTitle,
-                        displayIdentity: normalizedDisplayIdentity(selectedDisplayTitle),
-                        isDisplayLocal: isLocal,
-                        requestedInputValue: nil
-                    )
+                var message = PeerMessage(
+                    type: "status",
+                    senderID: instanceID,
+                    senderName: instanceName,
+                    displayTitle: selectedDisplayTitle,
+                    displayIdentity: normalizedDisplayIdentity(selectedDisplayTitle),
+                    isDisplayLocal: isLocal,
+                    requestedInputValue: nil
                 )
+                message.currentInputValue = isLocal ? currentInputValue : nil
+                message.ownInputValue = learnedMacNames.first(where: { $0.value == instanceName })?.key
+                peerManager?.broadcast(message)
+            }
+        } else if previousOwnerName != knownMonitorOwnerName {
+            buildMenu()
+        }
+    }
+
+    func sampleCurrentInputForLearning() {
+        guard let displayIndex = currentDisplayIndex(),
+              Date().timeIntervalSince(lastSwitchDate) > 8 else {
+            pendingLearnedInput = nil
+            return
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            let value = DDCController.getCurrentInput(displayIndex: displayIndex)
+            DispatchQueue.main.async {
+                self.handleSampledInput(value)
             }
         }
     }
 
+    func handleSampledInput(_ value: Int?) {
+        guard let value,
+              currentDisplayOption() != nil,
+              Date().timeIntervalSince(lastSwitchDate) > 8 else {
+            pendingLearnedInput = nil
+            return
+        }
+
+        let changed = currentInputValue != value
+        currentInputValue = value
+
+        if pendingLearnedInput == value {
+            learnMacName(instanceName, forInput: value)
+        }
+        pendingLearnedInput = value
+
+        if changed {
+            refreshMonitorLocation(forceBroadcast: true)
+        }
+    }
+
+    func learnMacName(_ name: String, forInput value: Int) {
+        guard learnedMacNames[value] != name else { return }
+        learnedMacNames = learnedMacNames.filter { $0.value != name }
+        learnedMacNames[value] = name
+        saveLearnedMacNames(learnedMacNames)
+        logDiagnostics("Learned input owner: input=\(value) mac=\(name)")
+
+        if name == instanceName {
+            refreshMonitorLocation(forceBroadcast: true)
+        } else {
+            buildMenu()
+        }
+    }
+
+    func learnedNickname(for source: InputSource) -> String? {
+        guard let name = learnedMacNames[source.value] else { return nil }
+        return name == instanceName ? loc("Bu Mac", "This Mac") : name
+    }
+
+    func effectiveNickname(for source: InputSource) -> String {
+        source.trimmedNickname.isEmpty ? (learnedNickname(for: source) ?? "") : source.trimmedNickname
+    }
+
+    var showOwnerInMenuBar: Bool {
+        get { UserDefaults.standard.bool(forKey: "showOwnerInMenuBar") }
+        set { UserDefaults.standard.set(newValue, forKey: "showOwnerInMenuBar") }
+    }
+
+    func onScreenLabel() -> String? {
+        let ownerName = currentDisplayOption() != nil ? instanceName : knownMonitorOwnerName
+        if let currentInputValue,
+           let source = inputs.first(where: { $0.value == currentInputValue }),
+           !source.trimmedNickname.isEmpty {
+            return source.trimmedNickname
+        }
+        return ownerName
+    }
+
+    func updateStatusButtonTitle() {
+        guard let button = statusItem?.button else { return }
+
+        guard showOwnerInMenuBar, let label = onScreenLabel() else {
+            button.title = ""
+            button.imagePosition = .imageOnly
+            return
+        }
+
+        let maxLength = 18
+        let shortLabel = label.count > maxLength ? String(label.prefix(maxLength - 1)) + "…" : label
+        button.title = " \(shortLabel)"
+        button.imagePosition = .imageLeading
+    }
+
+    @objc func toggleShowOwnerInMenuBar() {
+        showOwnerInMenuBar.toggle()
+        buildMenu()
+    }
+
     func monitorLocationText() -> String {
         if currentDisplayOption() != nil {
-            return loc("Monitör: Bu Mac", "Display: This Mac")
+            return loc("Ekranda: Bu Mac (\(instanceName))", "On screen: This Mac (\(instanceName))")
         }
 
         if let knownMonitorOwnerName {
-            return loc("Monitör: \(knownMonitorOwnerName)", "Display: \(knownMonitorOwnerName)")
+            return loc("Ekranda: \(knownMonitorOwnerName)", "On screen: \(knownMonitorOwnerName)")
         }
 
         return loc("Monitör: Ağda aranıyor", "Display: Searching network")
@@ -1476,10 +1600,23 @@ extension AppDelegate: PeerManagerDelegate {
             return
         }
 
-        if message.type == "status", message.isDisplayLocal == true {
-            if currentDisplayOption() == nil {
+        if message.type == "status" {
+            if let ownInputValue = message.ownInputValue {
+                learnMacName(message.senderName, forInput: ownInputValue)
+            }
+
+            guard currentDisplayOption() == nil else { return }
+
+            if message.isDisplayLocal == true {
                 knownMonitorOwnerName = message.senderName
-                logDiagnostics("Peer status accepted: owner=\(message.senderName)")
+                if let remoteInputValue = message.currentInputValue {
+                    currentInputValue = remoteInputValue
+                }
+                logDiagnostics("Peer status accepted: owner=\(message.senderName) input=\(message.currentInputValue.map(String.init) ?? "-")")
+                buildMenu()
+            } else if knownMonitorOwnerName == message.senderName {
+                knownMonitorOwnerName = nil
+                logDiagnostics("Peer status: \(message.senderName) no longer owns the display")
                 buildMenu()
             }
             return
@@ -1609,6 +1746,18 @@ extension AppDelegate {
             return .auto
         }
         return mode
+    }
+
+    func saveLearnedMacNames(_ names: [Int: String]) {
+        let data = Dictionary(uniqueKeysWithValues: names.map { (String($0.key), $0.value) })
+        UserDefaults.standard.set(data, forKey: "learnedMacNames")
+    }
+
+    func loadLearnedMacNames() -> [Int: String] {
+        guard let data = UserDefaults.standard.dictionary(forKey: "learnedMacNames") as? [String: String] else {
+            return [:]
+        }
+        return Dictionary(uniqueKeysWithValues: data.compactMap { key, value in Int(key).map { ($0, value) } })
     }
 
     func loadOrCreateInstanceID() -> String {
