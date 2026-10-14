@@ -2,6 +2,8 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
@@ -82,11 +84,10 @@ else
 fi
 
 # Swift dosyasının konumu
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SWIFT_FILE="$SCRIPT_DIR/InputSwitcher.swift"
 VERSION_FILE="$SCRIPT_DIR/VERSION"
 
-chmod +x "$SCRIPT_DIR/install.command" "$SCRIPT_DIR/install.sh"
+chmod +x "$SCRIPT_DIR/install.command" "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/build_app.sh"
 
 if [ ! -f "$SWIFT_FILE" ]; then
     echo -e "${RED}Hata: InputSwitcher.swift bulunamadı: $SWIFT_FILE${NC}"
@@ -109,60 +110,14 @@ APP_DIR="$HOME/Applications"
 mkdir -p "$APP_DIR"
 
 APP_BUNDLE="$APP_DIR/InputSwitcher.app"
-BUILD_ROOT="$(mktemp -d)"
-TEMP_APP_BUNDLE="$BUILD_ROOT/InputSwitcher.app"
-MACOS_DIR="$TEMP_APP_BUNDLE/Contents/MacOS"
-RESOURCES_DIR="$TEMP_APP_BUNDLE/Contents/Resources"
-
-mkdir -p "$MACOS_DIR"
-mkdir -p "$RESOURCES_DIR"
 
 echo ""
-echo -e "${YELLOW}Uygulama derleniyor... (v$APP_VERSION)${NC}"
+"$SCRIPT_DIR/build_app.sh" >/dev/null
+BUILT_APP_BUNDLE="$SCRIPT_DIR/build/InputSwitcher.app"
 
-swiftc "$SWIFT_FILE" \
-    -o "$MACOS_DIR/InputSwitcher" \
-    -framework Cocoa \
-    -framework Foundation \
-    -framework Network \
-    2>&1
-
-echo -e "${GREEN}✓ Derleme tamamlandı${NC}"
-
-# Info.plist oluştur
-cat > "$TEMP_APP_BUNDLE/Contents/Info.plist" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>InputSwitcher</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.local.inputswitcher</string>
-    <key>CFBundleName</key>
-    <string>Input Switcher</string>
-    <key>CFBundleShortVersionString</key>
-    <string>$APP_VERSION</string>
-    <key>CFBundleVersion</key>
-    <string>$APP_VERSION</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSLocalNetworkUsageDescription</key>
-    <string>Input Switcher needs local network access to discover the other Mac and send monitor switch requests.</string>
-    <key>NSBonjourServices</key>
-    <array>
-        <string>_inputswitcher._tcp</string>
-    </array>
-</dict>
-</plist>
-EOF
-
-echo -e "${GREEN}✓ App bundle hazırlandı${NC}"
-
-if command -v codesign >/dev/null 2>&1; then
-    codesign --force --deep --sign - "$TEMP_APP_BUNDLE" >/dev/null 2>&1 || true
+if [ ! -d "$BUILT_APP_BUNDLE" ]; then
+    echo -e "${RED}Hata: Derleme başarısız oldu.${NC}"
+    exit 1
 fi
 
 if pgrep -f "$APP_BUNDLE/Contents/MacOS/InputSwitcher" > /dev/null; then
@@ -176,8 +131,7 @@ if [ -d "$APP_BUNDLE" ]; then
     rm -rf "$APP_BUNDLE"
 fi
 
-mv "$TEMP_APP_BUNDLE" "$APP_BUNDLE"
-rm -rf "$BUILD_ROOT"
+ditto "$BUILT_APP_BUNDLE" "$APP_BUNDLE"
 
 if command -v xattr >/dev/null 2>&1; then
     xattr -dr com.apple.quarantine "$APP_BUNDLE" 2>/dev/null || true
