@@ -1017,6 +1017,7 @@ class OSDWindowController {
 
 protocol SettingsDelegate: AnyObject {
     func didSaveSettings(inputs: [InputSource], shortcutConfig: ShortcutConfig?, displayIndex: Int, displayTitle: String)
+    func broadcastRemoteSwitch(inputValue: Int, displayTitle: String) -> Bool
 }
 
 // MARK: - App Delegate
@@ -2102,22 +2103,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        logDiagnostics("Remote switch broadcast: input=\(targetInputValue) displayIdentity=\(normalizedDisplayIdentity(selectedDisplayTitle) ?? "-") peers=\(peerManager.peers.count)")
+        _ = broadcastRemoteSwitch(inputValue: targetInputValue, displayTitle: selectedDisplayTitle)
+
+        let inputName = inputs.first(where: { $0.value == targetInputValue })?.menuLabel ?? "Input \(targetInputValue)"
+        statusItem.button?.toolTip = loc("Uzak isteği gönderildi: \(inputName)", "Remote request sent: \(inputName)")
+    }
+
+    func broadcastRemoteSwitch(inputValue: Int, displayTitle: String) -> Bool {
+        guard let peerManager, peerManager.hasPeers() else { return false }
+
+        logDiagnostics("Remote switch broadcast: input=\(inputValue) displayIdentity=\(normalizedDisplayIdentity(displayTitle) ?? "-") peers=\(peerManager.peers.count)")
 
         peerManager.broadcast(
             PeerMessage(
                 type: "switchRequest",
                 senderID: instanceID,
                 senderName: instanceName,
-                displayTitle: selectedDisplayTitle,
-                displayIdentity: normalizedDisplayIdentity(selectedDisplayTitle),
+                displayTitle: displayTitle,
+                displayIdentity: normalizedDisplayIdentity(displayTitle),
                 isDisplayLocal: nil,
-                requestedInputValue: targetInputValue
+                requestedInputValue: inputValue
             )
         )
-
-        let inputName = inputs.first(where: { $0.value == targetInputValue })?.menuLabel ?? "Input \(targetInputValue)"
-        statusItem.button?.toolTip = loc("Uzak isteği gönderildi: \(inputName)", "Remote request sent: \(inputName)")
+        return true
     }
 
     func requestPeerStatus() {
@@ -2797,7 +2805,7 @@ class SettingsWindowController: NSWindowController {
         discoverButton.bezelStyle = .rounded
         discoverButton.target = self
         discoverButton.action = #selector(discoverInputs)
-        discoverButton.toolTip = loc("Seçili monitörde yaygın input/input-alt değerlerini sırayla dener ve günlüğe yazar.", "Tries common input/input-alt values on the selected display and logs the results.")
+        discoverButton.toolTip = loc("Yaygın input/input-alt değerlerini dener, ekran değişirse otomatik geri döner ve çalışan değerleri listeye uygular.", "Tries common input/input-alt values, switches back automatically when the screen changes, and can apply the working values to the list.")
         contentView.addSubview(discoverButton)
 
         let diagnosticsButton = NSButton(frame: NSRect(x: 780, y: 140, width: 140, height: 28))
@@ -3008,60 +3016,181 @@ class SettingsWindowController: NSWindowController {
         }
     }
 
+    struct DiscoveryResult {
+        let probe: DiscoveryProbe
+        let switched: Bool
+        let detectedValue: Int?
+        let cameBack: Bool
+    }
+
     @objc func discoverInputs() {
         guard let display = selectedDisplayOption() else {
-            presentWarningAlert(title: "Monitör seçilmedi", message: "Önce keşif yapılacak monitörü seç.")
+            presentWarningAlert(title: loc("Monitör seçilmedi", "No display selected"), message: loc("Önce keşif yapılacak monitörü seç.", "Select the display to scan first."))
             return
         }
 
         let alert = NSAlert()
-        alert.messageText = "Input keşfi başlatılsın mı?"
-        alert.informativeText = """
-        Yaygın input ve input-alt değerleri sırayla denenecek.
-        Monitör başka bir kaynağa geçerse ve bu Mac'ten ayrılırsa keşif o noktada durur.
-        Ayrıntılar Tanılama Günlüğü'ne yazılacak.
-        """
+        alert.messageText = loc("Otomatik input keşfi başlatılsın mı?", "Start automatic input discovery?")
+        alert.informativeText = loc(
+            "Yaygın input ve input-alt değerleri sırayla denenecek. Ekran başka bir kaynağa geçerse uygulama otomatik olarak geri dönmeye çalışır (doğrudan ya da diğer Mac üzerinden).\n\nEkran boş bir girişte kalırsa monitörün input tuşuyla bu Mac'e dön; keşif kaldığı yerden sonuçları gösterir.\n\nBitince bulunan değerleri listeye uygulayabilirsin.",
+            "Common input and input-alt values will be tried one by one. When the screen switches to another source, the app tries to switch back automatically (directly or through the other Mac).\n\nIf the screen gets stuck on an empty input, use the display's input button to come back to this Mac; discovery will then show what it found.\n\nWhen it's done you can apply the values it found to the list."
+        )
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Başlat")
-        alert.addButton(withTitle: "İptal")
+        alert.addButton(withTitle: loc("Başlat", "Start"))
+        alert.addButton(withTitle: loc("İptal", "Cancel"))
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         let probes = commonDiscoveryProbes(for: display.title)
+        let rowSources = rows.indices.compactMap { inputSourceForRow($0) }
         setTestingUIEnabled(false)
         logDiagnostics("Discovery started: display=\(display.title) probes=\(probes.map { "\($0.label)=\($0.source.commandMode.rawValue):\($0.source.value)" }.joined(separator: ","))")
 
         DispatchQueue.global(qos: .userInitiated).async {
-            var summary: [String] = []
+            let originalValue = DDCController.getCurrentInput(displayIndex: display.index)
+            let originalSource = originalValue.map { value in
+                rowSources.first(where: { $0.value == value }) ?? InputSource(name: "Input \(value)", value: value, icon: "display", nickname: "", includeInShortcutCycle: false, commandMode: .standard)
+            }
+            logDiagnostics("Discovery original input: \(originalValue.map(String.init) ?? "-")")
+
+            var results: [DiscoveryResult] = []
+            var stoppedEarly = false
 
             for probe in probes {
-                let result = DDCController.setInput(probe.source, displayIndex: display.index, displayTitle: display.title)
-                Thread.sleep(forTimeInterval: 1.5)
-                let stillLocal = self.monitorStillLocal(display.title)
-                let detectedValue = stillLocal ? DDCController.getCurrentInput(displayIndex: display.index) : nil
-                let trimmedOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-                summary.append("\(probe.label): \(probe.source.commandMode.title) \(probe.source.value) -> status \(result.status), local=\(stillLocal), get=\(detectedValue.map(String.init) ?? "-"), output=\(trimmedOutput.isEmpty ? "-" : trimmedOutput)")
-                logDiagnostics("Discovery probe finished: display=\(display.title) label=\(probe.label) mode=\(probe.source.commandMode.rawValue) value=\(probe.source.value) status=\(result.status) stillLocal=\(stillLocal) detected=\(detectedValue.map(String.init) ?? "-")")
+                if let originalValue, probe.source.commandMode == .standard, probe.source.value == originalValue {
+                    results.append(DiscoveryResult(probe: probe, switched: false, detectedValue: originalValue, cameBack: true))
+                    continue
+                }
 
-                if !stillLocal {
-                    summary.append("Keşif durdu: monitör bu Mac'ten ayrıldı.")
-                    logDiagnostics("Discovery stopped: selected display disappeared after \(probe.label)")
+                let result = DDCController.setInput(probe.source, displayIndex: display.index, displayTitle: display.title)
+                guard result.status == 0 else {
+                    results.append(DiscoveryResult(probe: probe, switched: false, detectedValue: nil, cameBack: true))
+                    continue
+                }
+
+                var switched = false
+                var detectedValue: Int?
+                for _ in 0..<6 {
+                    Thread.sleep(forTimeInterval: 0.5)
+                    if !self.monitorStillLocal(display.title) {
+                        switched = true
+                        break
+                    }
+                    detectedValue = DDCController.getCurrentInput(displayIndex: display.index)
+                    if let detectedValue, let originalValue, detectedValue != originalValue {
+                        switched = true
+                        break
+                    }
+                }
+
+                guard switched else {
+                    results.append(DiscoveryResult(probe: probe, switched: false, detectedValue: detectedValue, cameBack: true))
+                    logDiagnostics("Discovery probe: \(probe.label) \(probe.source.commandMode.rawValue):\(probe.source.value) -> no change")
+                    continue
+                }
+
+                logDiagnostics("Discovery probe: \(probe.label) \(probe.source.commandMode.rawValue):\(probe.source.value) -> switched detected=\(detectedValue.map(String.init) ?? "-")")
+                let cameBack = self.returnToOriginalInput(originalSource, display: display)
+                results.append(DiscoveryResult(probe: probe, switched: true, detectedValue: detectedValue, cameBack: cameBack))
+
+                if !cameBack {
+                    stoppedEarly = true
+                    logDiagnostics("Discovery stopped: display did not come back after \(probe.label)")
                     break
                 }
             }
 
             DispatchQueue.main.async {
                 self.setTestingUIEnabled(true)
-                self.presentInfoAlert(
-                    title: "Input keşfi tamamlandı",
-                    message: """
-                    Sonuçlar Tanılama Günlüğü'ne yazıldı.
-
-                    \(summary.joined(separator: "\n"))
-                    """
-                )
+                self.presentDiscoveryResults(results, originalValue: originalValue, stoppedEarly: stoppedEarly)
             }
         }
+    }
+
+    func returnToOriginalInput(_ originalSource: InputSource?, display: DisplayOption) -> Bool {
+        guard let originalSource else { return waitForDisplayToReturn(display: display, seconds: 60) }
+
+        var askedPeer = false
+        for _ in 0..<20 {
+            if monitorStillLocal(display.title) {
+                if DDCController.getCurrentInput(displayIndex: display.index) == originalSource.value {
+                    return true
+                }
+                _ = DDCController.setInput(originalSource, displayIndex: display.index, displayTitle: display.title)
+            } else if !askedPeer {
+                askedPeer = DispatchQueue.main.sync {
+                    self.delegate?.broadcastRemoteSwitch(inputValue: originalSource.value, displayTitle: display.title) ?? false
+                }
+            }
+            Thread.sleep(forTimeInterval: 1.0)
+        }
+
+        return waitForDisplayToReturn(display: display, seconds: 60)
+    }
+
+    func waitForDisplayToReturn(display: DisplayOption, seconds: Int) -> Bool {
+        for _ in 0..<seconds {
+            if monitorStillLocal(display.title) {
+                Thread.sleep(forTimeInterval: 1.5)
+                return true
+            }
+            Thread.sleep(forTimeInterval: 1.0)
+        }
+        return false
+    }
+
+    func presentDiscoveryResults(_ results: [DiscoveryResult], originalValue: Int?, stoppedEarly: Bool) {
+        let working = results.filter { $0.switched }
+        var lines: [String] = []
+
+        if let originalValue {
+            lines.append(loc("Bu Mac'in girişi: \(originalValue)", "This Mac's input: \(originalValue)"))
+        }
+        for result in results {
+            let command = "\(result.probe.source.commandMode.commandName) \(result.probe.source.value)"
+            let status: String
+            if result.probe.source.value == originalValue && result.probe.source.commandMode == .standard {
+                status = loc("bu Mac", "this Mac")
+            } else if result.switched {
+                status = result.cameBack ? loc("✓ çalışıyor", "✓ works") : loc("✓ çalışıyor (geri dönülemedi)", "✓ works (could not return)")
+            } else {
+                status = loc("etkisiz", "no effect")
+            }
+            lines.append("\(result.probe.label) — \(command): \(status)")
+        }
+        if stoppedEarly {
+            lines.append("")
+            lines.append(loc("Keşif erken durdu; kalan değerler denenmedi.", "Discovery stopped early; the remaining values were not tried."))
+        }
+
+        let alert = NSAlert()
+        alert.messageText = working.isEmpty
+            ? loc("Çalışan yeni input bulunamadı", "No working inputs found")
+            : loc("\(working.count) çalışan input bulundu", "Found \(working.count) working input(s)")
+        alert.informativeText = lines.joined(separator: "\n")
+        alert.alertStyle = .informational
+        if !working.isEmpty {
+            alert.addButton(withTitle: loc("Listeye Uygula", "Apply to List"))
+        }
+        alert.addButton(withTitle: loc("Kapat", "Close"))
+
+        let response = alert.runModal()
+        guard !working.isEmpty, response == .alertFirstButtonReturn else { return }
+
+        var appliedLabels = Set<String>()
+        for result in working where !appliedLabels.contains(result.probe.label) {
+            guard let row = rows.first(where: {
+                $0.nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(result.probe.label) == .orderedSame
+            }) else { continue }
+
+            row.valueField.stringValue = "\(result.probe.source.value)"
+            if let modeIndex = InputCommandMode.allCases.firstIndex(of: result.probe.source.commandMode) {
+                row.commandModePopup.selectItem(at: modeIndex)
+            }
+            appliedLabels.insert(result.probe.label)
+        }
+        logDiagnostics("Discovery applied: \(appliedLabels.sorted().joined(separator: ","))")
+        shortcutHelpLabel.stringValue = loc("Keşif sonuçları listeye uygulandı. Kalıcı olması için Kaydet'e bas.", "Discovery results applied to the list. Press Save to keep them.")
     }
 
     @objc func save() {
