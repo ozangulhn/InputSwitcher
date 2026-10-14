@@ -3,7 +3,7 @@
 Apple Silicon Mac için menü bar monitör input değiştirici.  
 BetterDisplay'e gerek yok — `m1ddc` kullanılır, tamamen ücretsiz.
 
-Mevcut sürüm: `1.5.1`
+Mevcut sürüm: `1.6.0` · [English](#english)
 
 ---
 
@@ -43,11 +43,21 @@ Menü barındaki 🖥 ikonuna tıkla → Input seç → geçiş olur.
 
 Aktif input listede mavi vurgulanır ve işaretlenir.
 
+Menüde ayrıca:
+- **Parlaklık ve ses kaydırıcıları** (monitör bu Mac'e bağlıyken, DDC ile). Hoparlör simgesine tıklamak sesi kapatır/açar.
+- **Ekranda: …** satırı monitörün o an hangi Mac'te olduğunu gösterir. `Ekrandaki Mac'i Menü Çubuğunda Göster` ile bu bilgi menü çubuğunda da görünür.
+- **Klavye Tuşları**: parlaklık tuşları (imleç harici monitördeyken) ve ses/sessiz tuşları monitörü DDC ile ayarlayabilir. Option+Shift ince adım verir. Erişilebilirlik izni gerekir; uygulama her yeniden kurulduğunda imza değiştiği için izni tekrar vermen gerekebilir.
+- **Dil**: Sistem / Türkçe / English.
+
+Uygulama hangi Mac'in hangi girişte olduğunu kendiliğinden öğrenir (iki kararlı ölçüm sonrası) ve takma adı boş olan input'ların yanında `◦ Mac adı` olarak gösterir.
+
 `Input Listesini Düzenle...` ekranından:
 - Her input için nickname/alias ekleyebilir, değiştirebilir veya alanı boş bırakarak silebilirsin
 - Her input için ham DDC değeri ve komut modunu (`Auto`, `input`, `input-alt`) ayrı ayrı ayarlayabilirsin
 - Kısayol döngüsüne dahil olacak input'ları seçebilirsin
-- Global kısayol kaydedebilirsin; bu kısayol yalnızca işaretlediğin input'lar arasında geçer
+- Global döngü kısayolu kaydedebilirsin; bu kısayol yalnızca `Döngüde` işaretli input'lar arasında geçer
+- Her input için ayrı bir global kısayol atayabilirsin (`Kısayol` sütunu); aynı kısayol iki yerde kullanılamaz
+- `Input Keşfet...` yaygın DDC değerlerini dener, ekran değişirse otomatik geri döner (doğrudan ya da diğer Mac üzerinden) ve çalışan değerleri tek tıkla listeye uygular
 - Hedef monitörü seçebilirsin
 
 Uygulama aynı ağdaki diğer Input Switcher instance'larını bulur. Monitör bu Mac'te bağlı değilse, seçilen input için diğer Mac'e uzaktan geçiş isteği gönderir.
@@ -103,3 +113,16 @@ m1ddc display list
 DP1=208, DP2=209, HDMI1=144, HDMI2=145
 
 **M1 Mac Mini / built-in HDMI:** Yerleşik HDMI portu desteklenmez, USB-C adaptör kullan.
+
+---
+
+## English
+
+Menu bar display input switcher for Apple Silicon Macs, powered by `m1ddc` (free, no BetterDisplay needed). The UI follows the macOS language; switch it under **Language** in the menu.
+
+- Install: double-click `install.command` (re-running it upgrades the existing app). Build a DMG with `build_dmg.command`.
+- Switch inputs from the menu, with a cycle shortcut, or with a dedicated global hotkey per input.
+- Brightness and volume sliders in the menu; optionally let the brightness keys (while the pointer is on the external display) and volume/mute keys control the display over DDC (needs Accessibility permission).
+- With Input Switcher on both Macs, they find each other over Bonjour: the menu shows which Mac is on screen, learns which input belongs to which Mac, and forwards a switch to the Mac that currently owns the display.
+- **Discover Inputs...** probes common DDC values, switches back automatically, and applies the working values to the list.
+- **Diagnostics Log** shows peer discovery, display ownership and switch requests; **Copy All** copies everything.
