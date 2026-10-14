@@ -1013,6 +1013,538 @@ class OSDWindowController {
     }
 }
 
+// MARK: - Updates
+
+let updateRepository = "ozangulhn/InputSwitcher"
+
+struct ReleaseAsset: Decodable {
+    let name: String
+    let browser_download_url: String
+    let size: Int?
+}
+
+struct ReleaseInfo: Decodable {
+    let tag_name: String
+    let html_url: String
+    let body: String?
+    let draft: Bool?
+    let prerelease: Bool?
+    let assets: [ReleaseAsset]?
+
+    var version: String { normalizedVersion(tag_name) }
+}
+
+func normalizedVersion(_ raw: String) -> String {
+    var version = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if version.hasPrefix("v") || version.hasPrefix("V") {
+        version.removeFirst()
+    }
+    return version
+}
+
+func versionComponents(_ raw: String) -> [Int] {
+    normalizedVersion(raw)
+        .split(separator: ".", omittingEmptySubsequences: false)
+        .map { Int($0.prefix(while: { ("0"..."9").contains($0) })) ?? 0 }
+}
+
+func compareVersions(_ lhs: String, _ rhs: String) -> ComparisonResult {
+    let left = versionComponents(lhs)
+    let right = versionComponents(rhs)
+    for index in 0..<max(left.count, right.count) {
+        let a = index < left.count ? left[index] : 0
+        let b = index < right.count ? right[index] : 0
+        if a != b {
+            return a < b ? .orderedAscending : .orderedDescending
+        }
+    }
+    return .orderedSame
+}
+
+struct UpdateError: Error {
+    let message: String
+}
+
+final class UpdateManager: NSObject {
+    enum CheckResult {
+        case available(ReleaseInfo)
+        case upToDate
+        case noReleases
+        case failure(String)
+    }
+
+    private(set) var availableRelease: ReleaseInfo?
+    private(set) var isChecking = false
+    private(set) var isInstalling = false
+    private var downloadPercent: Int?
+    private var downloadTask: URLSessionDownloadTask?
+    private var progressObservation: NSKeyValueObservation?
+    private var startupTimer: Timer?
+    private var periodicTimer: Timer?
+
+    var onStateChange: (() -> Void)?
+    var onProgress: (() -> Void)?
+
+    override init() {
+        super.init()
+        UserDefaults.standard.register(defaults: ["autoCheckForUpdates": true])
+    }
+
+    var autoCheckEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "autoCheckForUpdates") }
+        set { UserDefaults.standard.set(newValue, forKey: "autoCheckForUpdates") }
+    }
+
+    var autoInstallEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "autoInstallUpdates") }
+        set { UserDefaults.standard.set(newValue, forKey: "autoInstallUpdates") }
+    }
+
+    private var lastNotifiedVersion: String? {
+        get { UserDefaults.standard.string(forKey: "lastNotifiedUpdateVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "lastNotifiedUpdateVersion") }
+    }
+
+    func menuItemTitle() -> String {
+        if isInstalling {
+            if let percent = downloadPercent {
+                return loc("İndiriliyor… \(percent)%", "Downloading… \(percent)%")
+            }
+            return loc("Yükleniyor…", "Installing…")
+        }
+        let version = availableRelease?.version ?? ""
+        return loc("Güncelleme var: \(version) — Yükle", "Update available: \(version) — Install")
+    }
+
+    // MARK: Scheduling
+
+    func startAutomaticChecks() {
+        startupTimer?.invalidate()
+        startupTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
+            self?.runScheduledCheck()
+        }
+        periodicTimer?.invalidate()
+        periodicTimer = Timer.scheduledTimer(withTimeInterval: 6 * 60 * 60, repeats: true) { [weak self] _ in
+            self?.runScheduledCheck()
+        }
+    }
+
+    private func runScheduledCheck() {
+        guard autoCheckEnabled else {
+            logDiagnostics("Update check skipped: automatic checks disabled")
+            return
+        }
+        checkForUpdates(userInitiated: false)
+    }
+
+    // MARK: Checking
+
+    func checkForUpdates(userInitiated: Bool) {
+        guard !isChecking, !isInstalling else {
+            logDiagnostics("Update check skipped: already \(isInstalling ? "installing" : "checking")")
+            return
+        }
+        isChecking = true
+        onStateChange?()
+        logDiagnostics("Update check started: current=\(appVersionString()) repo=\(updateRepository) manual=\(userInitiated)")
+
+        fetchLatestRelease { [weak self] result in
+            DispatchQueue.main.async {
+                self?.handleCheckResult(result, userInitiated: userInitiated)
+            }
+        }
+    }
+
+    private func fetchLatestRelease(completion: @escaping (CheckResult) -> Void) {
+        guard let url = URL(string: "https://api.github.com/repos/\(updateRepository)/releases/latest") else {
+            completion(.failure("Invalid update URL"))
+            return
+        }
+        var request = URLRequest(url: url, timeoutInterval: 20)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("InputSwitcher/\(appVersionString())", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(error.localizedDescription))
+                return
+            }
+            guard let http = response as? HTTPURLResponse else {
+                completion(.failure("No HTTP response"))
+                return
+            }
+            if http.statusCode == 404 {
+                completion(.noReleases)
+                return
+            }
+            guard http.statusCode == 200, let data else {
+                completion(.failure("HTTP \(http.statusCode)"))
+                return
+            }
+            do {
+                let release = try JSONDecoder().decode(ReleaseInfo.self, from: data)
+                if release.draft == true || release.prerelease == true {
+                    completion(.upToDate)
+                } else if compareVersions(release.version, appVersionString()) == .orderedDescending {
+                    completion(.available(release))
+                } else {
+                    completion(.upToDate)
+                }
+            } catch {
+                completion(.failure("Invalid release data: \(error.localizedDescription)"))
+            }
+        }.resume()
+    }
+
+    private func handleCheckResult(_ result: CheckResult, userInitiated: Bool) {
+        isChecking = false
+        switch result {
+        case .available(let release):
+            availableRelease = release
+            logDiagnostics("Update available: \(release.version) (current \(appVersionString()))")
+            onStateChange?()
+            if autoInstallEnabled && !userInitiated {
+                install(release, userInitiated: false)
+            } else if userInitiated || lastNotifiedVersion != release.version {
+                presentAvailable(release)
+            }
+        case .upToDate:
+            availableRelease = nil
+            logDiagnostics("Update check: up to date (\(appVersionString()))")
+            onStateChange?()
+            if userInitiated {
+                showAlert(
+                    title: loc("Güncel sürümü kullanıyorsunuz", "You're up to date"),
+                    message: loc("Input Switcher \(appVersionString()) en son sürüm.", "Input Switcher \(appVersionString()) is the latest version.")
+                )
+            }
+        case .noReleases:
+            availableRelease = nil
+            logDiagnostics("Update check: no releases found for \(updateRepository) (404)")
+            onStateChange?()
+            if userInitiated {
+                showAlert(
+                    title: loc("Yayınlanmış sürüm yok", "No releases published"),
+                    message: loc("Henüz yayınlanmış bir sürüm bulunamadı.", "No published release was found yet.")
+                )
+            }
+        case .failure(let message):
+            logDiagnostics("Update check failed: \(message)")
+            onStateChange?()
+            if userInitiated {
+                showAlert(
+                    title: loc("Güncellemeler denetlenemedi", "Couldn't check for updates"),
+                    message: message
+                )
+            }
+        }
+    }
+
+    private func releaseNotesExcerpt(_ release: ReleaseInfo) -> String {
+        let text = (release.body ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "" }
+        return text.count > 600 ? String(text.prefix(600)) + "…" : text
+    }
+
+    private func presentAvailable(_ release: ReleaseInfo) {
+        lastNotifiedVersion = release.version
+        var message = loc(
+            "Yeni sürüm: \(release.version)\nMevcut sürüm: \(appVersionString())",
+            "New version: \(release.version)\nCurrent version: \(appVersionString())"
+        )
+        let notes = releaseNotesExcerpt(release)
+        if !notes.isEmpty {
+            message += "\n\n" + notes
+        }
+
+        let alert = NSAlert()
+        alert.messageText = loc("Güncelleme var", "Update available")
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: loc("Yükle", "Install"))
+        alert.addButton(withTitle: loc("Sürüm Sayfası", "Release Page"))
+        alert.addButton(withTitle: loc("Sonra", "Later"))
+        NSApp.activate(ignoringOtherApps: true)
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            install(release, userInitiated: true)
+        case .alertSecondButtonReturn:
+            openReleasePage(release)
+        default:
+            break
+        }
+    }
+
+    private func openReleasePage(_ release: ReleaseInfo) {
+        if let url = URL(string: release.html_url) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func showAlert(title: String, message: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: loc("Tamam", "OK"))
+        alert.runModal()
+    }
+
+    // MARK: Installing
+
+    func installAvailableUpdate() {
+        guard let release = availableRelease else { return }
+        install(release, userInitiated: true)
+    }
+
+    private func install(_ release: ReleaseInfo, userInitiated: Bool) {
+        guard !isInstalling else { return }
+
+        guard let asset = release.assets?.first(where: { $0.name.lowercased().hasSuffix(".zip") }),
+              let assetURL = URL(string: asset.browser_download_url) else {
+            logDiagnostics("Update install: no .zip asset in release \(release.version)")
+            if userInitiated {
+                openReleasePage(release)
+            }
+            return
+        }
+
+        let targetURL = URL(fileURLWithPath: Bundle.main.bundlePath)
+        let parentPath = targetURL.deletingLastPathComponent().path
+        guard targetURL.pathExtension == "app", FileManager.default.isWritableFile(atPath: parentPath) else {
+            logDiagnostics("Update install: cannot replace \(targetURL.path) (not writable)")
+            if userInitiated {
+                showAlert(
+                    title: loc("Otomatik güncelleme yapılamadı", "Can't update automatically"),
+                    message: loc(
+                        "Uygulamanın bulunduğu klasöre yazma izniniz yok. Sürüm sayfası açılıyor; yeni sürümü elle yükleyin.",
+                        "You don't have write access to the folder containing the app. Opening the release page so you can install the new version manually."
+                    )
+                )
+                openReleasePage(release)
+            }
+            return
+        }
+
+        let workDir = FileManager.default.temporaryDirectory.appendingPathComponent("InputSwitcherUpdate-\(UUID().uuidString)")
+        do {
+            try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        } catch {
+            finishInstallFailure(UpdateError(message: error.localizedDescription), workDir: workDir, userInitiated: userInitiated)
+            return
+        }
+
+        isInstalling = true
+        downloadPercent = 0
+        onStateChange?()
+        logDiagnostics("Update install: downloading \(asset.name) (\(release.version)) from \(assetURL.absoluteString)")
+
+        var request = URLRequest(url: assetURL, timeoutInterval: 60)
+        request.setValue("InputSwitcher/\(appVersionString())", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+
+        let expectedSize = Int64(asset.size ?? 0)
+        let task = URLSession.shared.downloadTask(with: request) { [weak self] location, response, error in
+            let zipURL = workDir.appendingPathComponent("update.zip")
+            var failure: UpdateError?
+            if let error {
+                failure = UpdateError(message: error.localizedDescription)
+            } else if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                failure = UpdateError(message: "HTTP \(http.statusCode)")
+            } else if let location {
+                do {
+                    try FileManager.default.moveItem(at: location, to: zipURL)
+                } catch {
+                    failure = UpdateError(message: error.localizedDescription)
+                }
+            } else {
+                failure = UpdateError(message: "Download failed")
+            }
+
+            if let failure {
+                DispatchQueue.main.async {
+                    self?.finishInstallFailure(failure, workDir: workDir, userInitiated: userInitiated)
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self?.downloadPercent = nil
+                self?.onProgress?()
+            }
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    let newApp = try UpdateManager.prepareUpdate(zipURL: zipURL, workDir: workDir, release: release)
+                    let scriptURL = try UpdateManager.writeInstallScript(in: workDir)
+                    DispatchQueue.main.async {
+                        self?.launchInstaller(script: scriptURL, newApp: newApp, target: targetURL, workDir: workDir)
+                    }
+                } catch {
+                    let updateError = (error as? UpdateError) ?? UpdateError(message: error.localizedDescription)
+                    DispatchQueue.main.async {
+                        self?.finishInstallFailure(updateError, workDir: workDir, userInitiated: userInitiated)
+                    }
+                }
+            }
+        }
+
+        progressObservation = task.progress.observe(\.completedUnitCount) { [weak self] _, _ in
+            let received = task.countOfBytesReceived
+            let total = task.countOfBytesExpectedToReceive > 0 ? task.countOfBytesExpectedToReceive : expectedSize
+            guard total > 0 else { return }
+            let percent = min(100, Int(received * 100 / total))
+            DispatchQueue.main.async {
+                guard let self, self.isInstalling, self.downloadPercent != nil, percent != self.downloadPercent else { return }
+                self.downloadPercent = percent
+                self.onProgress?()
+            }
+        }
+        downloadTask = task
+        task.resume()
+    }
+
+    private static func prepareUpdate(zipURL: URL, workDir: URL, release: ReleaseInfo) throws -> URL {
+        let fileManager = FileManager.default
+        let extractDir = workDir.appendingPathComponent("extracted")
+        try fileManager.createDirectory(at: extractDir, withIntermediateDirectories: true)
+
+        logDiagnostics("Update install: extracting \(zipURL.lastPathComponent)")
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-x", "-k", zipURL.path, extractDir.path]
+        let errorPipe = Pipe()
+        ditto.standardError = errorPipe
+        ditto.standardOutput = FileHandle.nullDevice
+        try ditto.run()
+        ditto.waitUntilExit()
+        guard ditto.terminationStatus == 0 else {
+            let detail = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw UpdateError(message: "ditto failed (\(ditto.terminationStatus)) \(detail)")
+        }
+
+        guard let newApp = locateApp(in: extractDir) else {
+            throw UpdateError(message: loc("İndirilen pakette InputSwitcher.app bulunamadı.", "InputSwitcher.app was not found in the downloaded package."))
+        }
+
+        logDiagnostics("Update install: validating \(newApp.path)")
+        guard let bundle = Bundle(url: newApp), let info = bundle.infoDictionary else {
+            throw UpdateError(message: loc("İndirilen uygulama okunamadı.", "The downloaded app could not be read."))
+        }
+        guard let currentIdentifier = Bundle.main.bundleIdentifier,
+              info["CFBundleIdentifier"] as? String == currentIdentifier else {
+            throw UpdateError(message: loc("İndirilen uygulamanın kimliği eşleşmiyor.", "The downloaded app's bundle identifier doesn't match."))
+        }
+        let downloadedVersion = info["CFBundleShortVersionString"] as? String ?? ""
+        guard downloadedVersion == release.version else {
+            throw UpdateError(message: loc(
+                "İndirilen sürüm (\(downloadedVersion)) yayın sürümüyle (\(release.version)) eşleşmiyor.",
+                "The downloaded version (\(downloadedVersion)) doesn't match the release (\(release.version))."
+            ))
+        }
+        let executable = newApp.appendingPathComponent("Contents/MacOS/InputSwitcher").path
+        guard fileManager.isExecutableFile(atPath: executable) else {
+            throw UpdateError(message: loc("İndirilen uygulamada çalıştırılabilir dosya yok.", "The downloaded app has no executable."))
+        }
+        return newApp
+    }
+
+    private static func locateApp(in directory: URL) -> URL? {
+        let fileManager = FileManager.default
+        let direct = directory.appendingPathComponent("InputSwitcher.app")
+        if fileManager.fileExists(atPath: direct.path) {
+            return direct
+        }
+        guard let enumerator = fileManager.enumerator(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else {
+            return nil
+        }
+        for case let url as URL in enumerator {
+            if url.lastPathComponent == "InputSwitcher.app" {
+                return url
+            }
+            if enumerator.level >= 3 {
+                enumerator.skipDescendants()
+            }
+        }
+        return nil
+    }
+
+    private static func writeInstallScript(in workDir: URL) throws -> URL {
+        let script = """
+        #!/bin/bash
+        # Usage: install.sh <pid> <new app> <target app> <work dir>
+        PID="$1"
+        NEW_APP="$2"
+        TARGET="$3"
+        WORK_DIR="$4"
+
+        waited=0
+        while kill -0 "$PID" 2>/dev/null; do
+            sleep 0.25
+            waited=$((waited + 1))
+            if [ "$waited" -ge 80 ]; then
+                rm -rf "$WORK_DIR"
+                exit 1
+            fi
+        done
+
+        BACKUP="$WORK_DIR/previous.app"
+        mv "$TARGET" "$BACKUP" || rm -rf "$TARGET"
+        if ! mv "$NEW_APP" "$TARGET" 2>/dev/null; then
+            if ! /usr/bin/ditto "$NEW_APP" "$TARGET"; then
+                rm -rf "$TARGET"
+                [ -d "$BACKUP" ] && mv "$BACKUP" "$TARGET"
+            fi
+        fi
+
+        xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
+        open "$TARGET"
+        rm -rf "$WORK_DIR"
+        """
+        let scriptURL = workDir.appendingPathComponent("install.sh")
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
+    }
+
+    private func launchInstaller(script: URL, newApp: URL, target: URL, workDir: URL) {
+        downloadPercent = nil
+        onStateChange?()
+        let pid = String(ProcessInfo.processInfo.processIdentifier)
+        logDiagnostics("Update install: launching helper, replacing \(target.path)")
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [
+            "-c", "nohup /bin/bash \"$0\" \"$@\" >/dev/null 2>&1 &",
+            script.path, pid, newApp.path, target.path, workDir.path
+        ]
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            finishInstallFailure(UpdateError(message: error.localizedDescription), workDir: workDir, userInitiated: true)
+            return
+        }
+        logDiagnostics("Update install: helper started, quitting")
+        NSApp.terminate(nil)
+    }
+
+    private func finishInstallFailure(_ error: UpdateError, workDir: URL, userInitiated: Bool) {
+        logDiagnostics("Update install failed: \(error.message)")
+        try? FileManager.default.removeItem(at: workDir)
+        progressObservation = nil
+        downloadTask = nil
+        downloadPercent = nil
+        isInstalling = false
+        onStateChange?()
+        if userInitiated {
+            showAlert(title: loc("Güncelleme yüklenemedi", "Update failed"), message: error.message)
+        }
+    }
+}
+
 // MARK: - Settings Delegate
 
 protocol SettingsDelegate: AnyObject {
@@ -1042,6 +1574,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var diagnosticsWindowController: DiagnosticsWindowController?
     var peerManager: PeerManager?
     var monitorStatusTimer: Timer?
+    let updateManager = UpdateManager()
+    var updateMenuItem: NSMenuItem?
     var knownMonitorOwnerName: String?
     var instanceID: String = UUID().uuidString
     let instanceName = localMachineName()
@@ -1094,7 +1628,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
+        updateManager.onStateChange = { [weak self] in
+            self?.buildMenu()
+        }
+        updateManager.onProgress = { [weak self] in
+            guard let self else { return }
+            self.updateMenuItem?.title = self.updateManager.menuItemTitle()
+        }
         buildMenu()
+        updateManager.startAutomaticChecks()
         refreshDisplayCache { [weak self] in
             guard let self else { return }
             self.refreshCurrentInput()
@@ -1150,6 +1692,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(titleItem)
 
         menu.addItem(.separator())
+
+        updateMenuItem = nil
+        if updateManager.availableRelease != nil || updateManager.isInstalling {
+            let updateItem = NSMenuItem(title: updateManager.menuItemTitle(), action: #selector(installAvailableUpdate), keyEquivalent: "")
+            updateItem.target = self
+            updateItem.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
+            updateItem.isEnabled = !updateManager.isInstalling
+            menu.addItem(updateItem)
+            updateMenuItem = updateItem
+            menu.addItem(.separator())
+        }
 
         if !DDCController.isM1ddcAvailable() {
             let warnItem = NSMenuItem(title: loc("⚠️  m1ddc bulunamadı", "⚠️  m1ddc not found"), action: nil, keyEquivalent: "")
@@ -1265,6 +1818,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         languageItem.submenu = languageMenu
         menu.addItem(languageItem)
+
+        let updatesItem = NSMenuItem(title: loc("Güncellemeler", "Updates"), action: nil, keyEquivalent: "")
+        updatesItem.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil)
+        let updatesMenu = NSMenu()
+        let autoCheckItem = NSMenuItem(title: loc("Güncellemeleri otomatik denetle", "Automatically check for updates"), action: #selector(toggleAutoCheckUpdates), keyEquivalent: "")
+        autoCheckItem.target = self
+        autoCheckItem.state = updateManager.autoCheckEnabled ? .on : .off
+        updatesMenu.addItem(autoCheckItem)
+        let autoInstallItem = NSMenuItem(title: loc("Güncellemeleri otomatik yükle", "Install updates automatically"), action: #selector(toggleAutoInstallUpdates), keyEquivalent: "")
+        autoInstallItem.target = self
+        autoInstallItem.state = updateManager.autoInstallEnabled ? .on : .off
+        updatesMenu.addItem(autoInstallItem)
+        updatesItem.submenu = updatesMenu
+        menu.addItem(updatesItem)
+
+        let checkUpdatesItem = NSMenuItem(title: loc("Güncellemeleri Denetle...", "Check for Updates..."), action: #selector(checkForUpdates), keyEquivalent: "")
+        checkUpdatesItem.target = self
+        checkUpdatesItem.isEnabled = !updateManager.isChecking && !updateManager.isInstalling
+        menu.addItem(checkUpdatesItem)
 
         let aboutItem = NSMenuItem(title: loc("Hakkında", "About"), action: #selector(showAbout), keyEquivalent: "")
         aboutItem.target = self
@@ -1712,6 +2284,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         aboutWindowController?.showWindow(nil)
         aboutWindowController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func checkForUpdates() {
+        updateManager.checkForUpdates(userInitiated: true)
+    }
+
+    @objc func installAvailableUpdate() {
+        updateManager.installAvailableUpdate()
+    }
+
+    @objc func toggleAutoCheckUpdates() {
+        updateManager.autoCheckEnabled.toggle()
+        buildMenu()
+    }
+
+    @objc func toggleAutoInstallUpdates() {
+        updateManager.autoInstallEnabled.toggle()
+        buildMenu()
     }
 
     @objc func showDiagnostics() {
