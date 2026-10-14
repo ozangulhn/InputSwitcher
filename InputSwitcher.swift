@@ -12,6 +12,7 @@ struct InputSource {
     let nickname: String
     let includeInShortcutCycle: Bool
     let commandMode: InputCommandMode
+    var hotKey: ShortcutConfig? = nil
 
     var trimmedNickname: String {
         nickname.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -22,7 +23,7 @@ struct InputSource {
     }
 }
 
-struct ShortcutConfig {
+struct ShortcutConfig: Equatable {
     let keyCode: UInt32
     let carbonModifiers: UInt32
 
@@ -46,6 +47,7 @@ struct InputRowControls {
     let commandModePopup: NSPopUpButton
     let testButton: NSButton
     let shortcutToggle: NSButton
+    let hotKeyRecorder: ShortcutRecorderButton
 }
 
 struct DisplayOption {
@@ -652,7 +654,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var shortcutConfig: ShortcutConfig?
     var selectedDisplayIndex = 1
     var selectedDisplayTitleValue: String?
-    var hotKeyRef: EventHotKeyRef?
+    var hotKeyRefs: [EventHotKeyRef] = []
     var hotKeyHandlerRef: EventHandlerRef?
     var settingsWindowController: SettingsWindowController?
     var aboutWindowController: AboutWindowController?
@@ -939,6 +941,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
+        if let hotKey = source.hotKey {
+            title.append(
+                NSAttributedString(
+                    string: "    \(hotKey.displayString)",
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: 11),
+                        .foregroundColor: NSColor.tertiaryLabelColor
+                    ]
+                )
+            )
+        }
+
         return title
     }
 
@@ -1095,10 +1109,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 )
 
                 let appDelegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-                if hotKeyID.signature == appDelegate.hotKeyID.signature && hotKeyID.id == appDelegate.hotKeyID.id {
-                    DispatchQueue.main.async {
-                        appDelegate.triggerShortcutCycle()
-                    }
+                guard hotKeyID.signature == appDelegate.hotKeyID.signature else { return noErr }
+
+                let pressedID = hotKeyID.id
+                DispatchQueue.main.async {
+                    appDelegate.handleHotKey(id: pressedID)
                 }
 
                 return noErr
@@ -1110,27 +1125,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    static let inputHotKeyBaseID: UInt32 = 100
+
     func registerGlobalShortcut() {
-        if let hotKeyRef {
+        for hotKeyRef in hotKeyRefs {
             UnregisterEventHotKey(hotKeyRef)
-            self.hotKeyRef = nil
+        }
+        hotKeyRefs.removeAll()
+
+        if let shortcutConfig {
+            registerHotKey(shortcutConfig, id: hotKeyID.id, label: "cycle")
         }
 
-        guard let shortcutConfig else { return }
+        for (index, source) in inputs.enumerated() {
+            guard let hotKey = source.hotKey else { continue }
+            registerHotKey(hotKey, id: AppDelegate.inputHotKeyBaseID + UInt32(index), label: source.name)
+        }
+    }
 
+    func registerHotKey(_ config: ShortcutConfig, id: UInt32, label: String) {
         var registeredHotKey: EventHotKeyRef?
         let status = RegisterEventHotKey(
-            shortcutConfig.keyCode,
-            shortcutConfig.carbonModifiers,
-            hotKeyID,
+            config.keyCode,
+            config.carbonModifiers,
+            EventHotKeyID(signature: hotKeyID.signature, id: id),
             GetApplicationEventTarget(),
             0,
             &registeredHotKey
         )
 
-        if status == noErr {
-            hotKeyRef = registeredHotKey
+        if status == noErr, let registeredHotKey {
+            hotKeyRefs.append(registeredHotKey)
+        } else {
+            logDiagnostics("Hotkey registration failed: target=\(label) shortcut=\(config.displayString) status=\(status)")
         }
+    }
+
+    func handleHotKey(id: UInt32) {
+        if id == hotKeyID.id {
+            triggerShortcutCycle()
+            return
+        }
+
+        guard id >= AppDelegate.inputHotKeyBaseID else { return }
+        let index = Int(id - AppDelegate.inputHotKeyBaseID)
+        guard index < inputs.count else { return }
+        logDiagnostics("Input hotkey pressed: input=\(inputs[index].value) label=\(inputs[index].menuLabel)")
+        switchToInputValue(inputs[index].value)
     }
 
     // MARK: - Actions
@@ -1467,7 +1508,9 @@ extension AppDelegate {
                 "icon": $0.icon,
                 "nickname": $0.trimmedNickname,
                 "includeInShortcutCycle": $0.includeInShortcutCycle,
-                "commandMode": $0.commandMode.rawValue
+                "commandMode": $0.commandMode.rawValue,
+                "hotKeyCode": $0.hotKey.map { Int($0.keyCode) } ?? -1,
+                "hotKeyModifiers": $0.hotKey.map { Int($0.carbonModifiers) } ?? 0
             ] as [String: Any]
         }
         UserDefaults.standard.set(data, forKey: "customInputs")
@@ -1490,6 +1533,9 @@ extension AppDelegate {
             let commandModeRaw = dict["commandMode"] as? String
             let legacyMode = loadInputCommandMode()
             let commandMode = commandModeRaw.flatMap(InputCommandMode.init(rawValue:)) ?? legacyMode
+            let hotKeyCode = dict["hotKeyCode"] as? Int ?? -1
+            let hotKeyModifiers = dict["hotKeyModifiers"] as? Int ?? 0
+            let hotKey = hotKeyCode >= 0 ? ShortcutConfig(keyCode: UInt32(hotKeyCode), carbonModifiers: UInt32(hotKeyModifiers)) : nil
 
             return InputSource(
                 name: name,
@@ -1497,7 +1543,8 @@ extension AppDelegate {
                 icon: icon,
                 nickname: nickname,
                 includeInShortcutCycle: includeInShortcutCycle,
-                commandMode: commandMode
+                commandMode: commandMode,
+                hotKey: hotKey
             )
         }
     }
@@ -1583,6 +1630,9 @@ class ShortcutRecorderButton: NSButton {
     }
 
     var statusHandler: ((String?) -> Void)?
+    var emptyTitle: String? {
+        didSet { updateAppearance() }
+    }
     var isRecordingShortcut = false {
         didSet { updateAppearance() }
     }
@@ -1654,7 +1704,7 @@ class ShortcutRecorderButton: NSButton {
     }
 
     func updateAppearance() {
-        title = isRecordingShortcut ? loc("Kısayola Bas...", "Press Shortcut...") : (shortcutConfig?.displayString ?? loc("Kısayol Kaydet", "Record Shortcut"))
+        title = isRecordingShortcut ? loc("Kısayola Bas...", "Press Shortcut...") : (shortcutConfig?.displayString ?? emptyTitle ?? loc("Kısayol Kaydet", "Record Shortcut"))
     }
 }
 
@@ -1912,7 +1962,8 @@ class SettingsWindowController: NSWindowController {
         tableContainer.addSubview(makeLabel(loc("DDC DEĞERİ", "DDC VALUE"), frame: NSRect(x: 360, y: CGFloat(containerHeight - 26), width: 100, height: 18), small: true))
         tableContainer.addSubview(makeLabel(loc("DDC KOMUTU", "DDC COMMAND"), frame: NSRect(x: 470, y: CGFloat(containerHeight - 26), width: 170, height: 18), small: true))
         tableContainer.addSubview(makeLabel("TEST", frame: NSRect(x: 680, y: CGFloat(containerHeight - 26), width: 60, height: 18), small: true))
-        tableContainer.addSubview(makeLabel(loc("DÖNGÜDE", "IN CYCLE"), frame: NSRect(x: 770, y: CGFloat(containerHeight - 26), width: 90, height: 18), small: true))
+        tableContainer.addSubview(makeLabel(loc("DÖNGÜDE", "IN CYCLE"), frame: NSRect(x: 752, y: CGFloat(containerHeight - 26), width: 80, height: 18), small: true))
+        tableContainer.addSubview(makeLabel(loc("KISAYOL", "HOTKEY"), frame: NSRect(x: 832, y: CGFloat(containerHeight - 26), width: 100, height: 18), small: true))
 
         rows = []
 
@@ -1954,9 +2005,20 @@ class SettingsWindowController: NSWindowController {
             tableContainer.addSubview(testButton)
 
             let shortcutToggle = NSButton(checkboxWithTitle: "", target: nil, action: nil)
-            shortcutToggle.frame = NSRect(x: 805, y: y + 4, width: 24, height: 24)
+            shortcutToggle.frame = NSRect(x: 775, y: y + 4, width: 24, height: 24)
             shortcutToggle.state = input.includeInShortcutCycle ? .on : .off
             tableContainer.addSubview(shortcutToggle)
+
+            let hotKeyRecorder = ShortcutRecorderButton(frame: NSRect(x: 822, y: y, width: 108, height: 28))
+            hotKeyRecorder.bezelStyle = .rounded
+            hotKeyRecorder.font = NSFont.systemFont(ofSize: 11)
+            hotKeyRecorder.emptyTitle = loc("Ata", "Set")
+            hotKeyRecorder.shortcutConfig = input.hotKey
+            hotKeyRecorder.toolTip = loc("Bu input'a doğrudan geçen global kısayol. Kayıt sırasında Delete temizler.", "Global shortcut that switches straight to this input. Press Delete while recording to clear.")
+            hotKeyRecorder.statusHandler = { [weak self] message in
+                self?.shortcutHelpLabel.stringValue = message ?? ""
+            }
+            tableContainer.addSubview(hotKeyRecorder)
 
             rows.append(
                 InputRowControls(
@@ -1965,7 +2027,8 @@ class SettingsWindowController: NSWindowController {
                     valueField: valueField,
                     commandModePopup: commandModePopup,
                     testButton: testButton,
-                    shortcutToggle: shortcutToggle
+                    shortcutToggle: shortcutToggle,
+                    hotKeyRecorder: hotKeyRecorder
                 )
             )
         }
@@ -2102,7 +2165,8 @@ class SettingsWindowController: NSWindowController {
             icon: fallback.icon,
             nickname: nickname,
             includeInShortcutCycle: row.shortcutToggle.state == .on,
-            commandMode: commandMode
+            commandMode: commandMode,
+            hotKey: row.hotKeyRecorder.shortcutConfig
         )
     }
 
@@ -2271,25 +2335,19 @@ class SettingsWindowController: NSWindowController {
     }
 
     @objc func save() {
-        var updatedInputs: [InputSource] = []
+        let updatedInputs = rows.indices.compactMap { inputSourceForRow($0) }
 
-        for (index, row) in rows.enumerated() {
-            let fallback = inputs[index]
-            let name = row.nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            let nickname = row.nicknameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            let value = Int(row.valueField.stringValue) ?? fallback.value
-            let commandMode = InputCommandMode.allCases[row.commandModePopup.indexOfSelectedItem]
-
-            updatedInputs.append(
-                InputSource(
-                    name: name.isEmpty ? fallback.name : name,
-                    value: value,
-                    icon: fallback.icon,
-                    nickname: nickname,
-                    includeInShortcutCycle: row.shortcutToggle.state == .on,
-                    commandMode: commandMode
+        var usedShortcuts: [ShortcutConfig] = shortcutConfig.map { [$0] } ?? []
+        for source in updatedInputs {
+            guard let hotKey = source.hotKey else { continue }
+            if usedShortcuts.contains(hotKey) {
+                presentWarningAlert(
+                    title: loc("Kısayol çakışması", "Shortcut conflict"),
+                    message: loc("\(hotKey.displayString) birden fazla yerde kullanılıyor. Her kısayol tek bir işe atanmalı.", "\(hotKey.displayString) is used more than once. Each shortcut can only have one action.")
                 )
-            )
+                return
+            }
+            usedShortcuts.append(hotKey)
         }
 
         let selectedDisplayIndex = displays[displayPopup.indexOfSelectedItem].index
