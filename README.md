@@ -2,7 +2,7 @@
 
 A menu bar display input switcher for Apple Silicon Macs. It switches an external monitor's input over DDC/CI using the [`m1ddc`](https://github.com/waydabber/m1ddc) CLI. No BetterDisplay needed, completely free.
 
-Current version: `1.7.0` · [Releases](https://github.com/ozangulhn/InputSwitcher/releases)
+Current version: `1.7.1` · [Releases](https://github.com/ozangulhn/InputSwitcher/releases)
 
 The app UI is available in English and Turkish. It follows the macOS language by default; switch it under **Language** in the menu (System / Türkçe / English).
 
@@ -196,6 +196,8 @@ LG monitors don't fully support standard DDC/CI input switching. Use `input-alt 
 | HDMI 1        | 144               |
 | HDMI 2        | 145               |
 | USB-C         | 210               |
+
+On LG models with a single DisplayPort (e.g. LG HDR 4K / 27UL850), USB-C is usually **209** instead of 210 (m1ddc lists 209 as "DisplayPort 2"). If USB-C doesn't switch, try 209.
 
 ---
 
