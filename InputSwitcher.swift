@@ -513,7 +513,9 @@ class DDCController {
         let result = run("\(m1ddcPath) display \(displayIndex) get input")
         guard result.status == 0 else { return nil }
         logDiagnostics("DDC getCurrentInput: display=\(displayIndex) output=\(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
-        return Int(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
+        // Some displays (e.g. LG) always report 0, which is not a real input.
+        guard let value = Int(result.output.trimmingCharacters(in: .whitespacesAndNewlines)), value > 0 else { return nil }
+        return value
     }
 
     static func listDisplays() -> String {
@@ -2936,7 +2938,7 @@ extension AppDelegate {
         guard let data = UserDefaults.standard.dictionary(forKey: "learnedMacNames") as? [String: String] else {
             return [:]
         }
-        return Dictionary(uniqueKeysWithValues: data.compactMap { key, value in Int(key).map { ($0, value) } })
+        return Dictionary(uniqueKeysWithValues: data.compactMap { key, value in Int(key).flatMap { $0 > 0 ? ($0, value) : nil } })
     }
 
     func loadOrCreateInstanceID() -> String {
