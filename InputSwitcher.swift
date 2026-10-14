@@ -574,7 +574,7 @@ class DDCController {
             status: task.terminationStatus,
             output: String(data: data, encoding: .utf8) ?? ""
         )
-        if result.status != 0 || command.contains(" set ") {
+        if result.status != 0 || command.contains(" set input") {
             let compactOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
             logDiagnostics("Shell result: status=\(result.status) command=\(command) output=\(compactOutput.isEmpty ? "-" : compactOutput)")
         }
@@ -640,6 +640,379 @@ class DDCController {
     }
 }
 
+// MARK: - Display Adjustments
+
+enum DDCControl: String, CaseIterable {
+    case luminance
+    case volume
+}
+
+extension DDCController {
+    static func getValue(_ control: DDCControl, displayIndex: Int) -> Int? {
+        guard let m1ddcPath = resolvedM1ddcPath() else { return nil }
+        let result = run("\(m1ddcPath) display \(displayIndex) get \(control.rawValue)")
+        guard result.status == 0 else { return nil }
+        return Int(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    static func maxValue(_ control: DDCControl, displayIndex: Int) -> Int? {
+        guard let m1ddcPath = resolvedM1ddcPath() else { return nil }
+        let result = run("\(m1ddcPath) display \(displayIndex) max \(control.rawValue)")
+        guard result.status == 0, let value = Int(result.output.trimmingCharacters(in: .whitespacesAndNewlines)), value > 0 else {
+            return nil
+        }
+        return value
+    }
+
+    static func setValue(_ control: DDCControl, value: Int, displayIndex: Int) -> ShellResult {
+        guard let m1ddcPath = resolvedM1ddcPath() else {
+            return ShellResult(status: 1, output: "m1ddc missing")
+        }
+        return run("\(m1ddcPath) display \(displayIndex) set \(control.rawValue) \(value)")
+    }
+
+    static func setMute(_ muted: Bool, displayIndex: Int) -> ShellResult {
+        guard let m1ddcPath = resolvedM1ddcPath() else {
+            return ShellResult(status: 1, output: "m1ddc missing")
+        }
+        return run("\(m1ddcPath) display \(displayIndex) set mute \(muted ? "on" : "off")")
+    }
+}
+
+class DisplayAdjustmentController {
+    private let queue = DispatchQueue(label: "InputSwitcher.DisplayAdjustments")
+    private var pendingWrites: [DDCControl: (value: Int, displayIndex: Int)] = [:]
+    private var isWriting = false
+    private var isRefreshing = false
+    private var refreshCompletions: [() -> Void] = []
+
+    private(set) var values: [DDCControl: Int] = [:]
+    private(set) var maxValues: [DDCControl: Int] = [:]
+    private(set) var isMuted = false
+    private(set) var loadedDisplayIndex: Int?
+
+    func maxValue(for control: DDCControl) -> Int {
+        maxValues[control] ?? 100
+    }
+
+    func refresh(displayIndex: Int, completion: @escaping () -> Void) {
+        refreshCompletions.append(completion)
+        guard !isRefreshing else { return }
+        isRefreshing = true
+
+        queue.async {
+            var readValues: [DDCControl: Int] = [:]
+            var readMaxValues: [DDCControl: Int] = [:]
+            for control in DDCControl.allCases {
+                readValues[control] = DDCController.getValue(control, displayIndex: displayIndex)
+                readMaxValues[control] = DDCController.maxValue(control, displayIndex: displayIndex)
+            }
+
+            DispatchQueue.main.async {
+                self.isRefreshing = false
+                self.loadedDisplayIndex = displayIndex
+                for control in DDCControl.allCases {
+                    if let value = readValues[control] {
+                        self.values[control] = value
+                    }
+                    if let maxValue = readMaxValues[control] {
+                        self.maxValues[control] = maxValue
+                    }
+                }
+                logDiagnostics("Display adjustments read: display=\(displayIndex) luminance=\(readValues[.luminance].map(String.init) ?? "-")/\(readMaxValues[.luminance].map(String.init) ?? "-") volume=\(readValues[.volume].map(String.init) ?? "-")/\(readMaxValues[.volume].map(String.init) ?? "-")")
+                let completions = self.refreshCompletions
+                self.refreshCompletions.removeAll()
+                completions.forEach { $0() }
+            }
+        }
+    }
+
+    func set(_ control: DDCControl, value: Int, displayIndex: Int) {
+        let clamped = min(max(value, 0), maxValue(for: control))
+        values[control] = clamped
+
+        queue.async {
+            self.pendingWrites[control] = (clamped, displayIndex)
+            self.drainWrites()
+        }
+    }
+
+    func step(_ control: DDCControl, fraction: Double, displayIndex: Int) -> Int {
+        let maxValue = maxValue(for: control)
+        let current = values[control] ?? maxValue / 2
+        let delta = max(1, Int((Double(maxValue) * abs(fraction)).rounded()))
+        let target = fraction >= 0 ? current + delta : current - delta
+        set(control, value: target, displayIndex: displayIndex)
+        return values[control] ?? target
+    }
+
+    func toggleMute(displayIndex: Int) -> Bool {
+        isMuted.toggle()
+        let muted = isMuted
+        queue.async {
+            let result = DDCController.setMute(muted, displayIndex: displayIndex)
+            if result.status != 0 {
+                logDiagnostics("Mute command failed: muted=\(muted)")
+            }
+        }
+        return muted
+    }
+
+    private func drainWrites() {
+        guard !isWriting else { return }
+        isWriting = true
+
+        while let (control, write) = pendingWrites.first {
+            pendingWrites.removeValue(forKey: control)
+            let result = DDCController.setValue(control, value: write.value, displayIndex: write.displayIndex)
+            if result.status != 0 {
+                logDiagnostics("Adjustment failed: control=\(control.rawValue) value=\(write.value) display=\(write.displayIndex)")
+            }
+        }
+
+        isWriting = false
+    }
+}
+
+// MARK: - Menu Slider
+
+class MenuSliderView: NSView {
+    let iconButton: NSButton
+    let slider: NSSlider
+    let valueLabel: NSTextField
+    var onChange: ((Int) -> Void)?
+    var onIconClick: (() -> Void)?
+
+    init(symbolName: String, accessibilityLabel: String) {
+        iconButton = NSButton(frame: NSRect(x: 14, y: 5, width: 22, height: 22))
+        slider = NSSlider(frame: NSRect(x: 42, y: 5, width: 168, height: 22))
+        valueLabel = NSTextField(frame: NSRect(x: 214, y: 8, width: 38, height: 16))
+        super.init(frame: NSRect(x: 0, y: 0, width: 260, height: 32))
+
+        iconButton.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityLabel)
+        iconButton.isBordered = false
+        iconButton.imagePosition = .imageOnly
+        iconButton.target = self
+        iconButton.action = #selector(iconClicked)
+        addSubview(iconButton)
+
+        slider.minValue = 0
+        slider.maxValue = 100
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(sliderChanged)
+        slider.isEnabled = false
+        slider.setAccessibilityLabel(accessibilityLabel)
+        addSubview(slider)
+
+        valueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        valueLabel.textColor = .secondaryLabelColor
+        valueLabel.alignment = .right
+        valueLabel.isBezeled = false
+        valueLabel.isEditable = false
+        valueLabel.backgroundColor = .clear
+        valueLabel.stringValue = "–"
+        addSubview(valueLabel)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func update(value: Int?, maxValue: Int) {
+        slider.maxValue = Double(maxValue)
+        if let value {
+            slider.doubleValue = Double(value)
+            slider.isEnabled = true
+            valueLabel.stringValue = "\(Int((Double(value) / Double(maxValue) * 100).rounded()))%"
+        } else {
+            slider.isEnabled = false
+            valueLabel.stringValue = "–"
+        }
+    }
+
+    @objc func sliderChanged() {
+        let value = Int(slider.doubleValue.rounded())
+        valueLabel.stringValue = "\(Int((slider.doubleValue / max(slider.maxValue, 1) * 100).rounded()))%"
+        onChange?(value)
+    }
+
+    @objc func iconClicked() {
+        onIconClick?()
+    }
+}
+
+// MARK: - Media Keys
+
+enum MediaKey: Int {
+    case soundUp = 0
+    case soundDown = 1
+    case brightnessUp = 2
+    case brightnessDown = 3
+    case mute = 7
+}
+
+class MediaKeyTap {
+    var handler: ((MediaKey, Bool, NSEvent.ModifierFlags) -> Bool)?
+    private(set) var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+
+    var isRunning: Bool {
+        eventTap != nil
+    }
+
+    func start() -> Bool {
+        guard eventTap == nil else { return true }
+
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon else { return Unmanaged.passUnretained(event) }
+            let tap = Unmanaged<MediaKeyTap>.fromOpaque(refcon).takeUnretainedValue()
+
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let eventTap = tap.eventTap {
+                    CGEvent.tapEnable(tap: eventTap, enable: true)
+                }
+                return Unmanaged.passUnretained(event)
+            }
+
+            guard type.rawValue == UInt32(NX_SYSDEFINED),
+                  let nsEvent = NSEvent(cgEvent: event),
+                  nsEvent.subtype.rawValue == 8 else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            let data1 = nsEvent.data1
+            let keyCode = (data1 & 0xFFFF0000) >> 16
+            let keyFlags = data1 & 0x0000FFFF
+            let isKeyDown = ((keyFlags & 0xFF00) >> 8) == 0xA
+
+            guard let key = MediaKey(rawValue: keyCode),
+                  let handler = tap.handler else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            let modifiers = nsEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            return handler(key, isKeyDown, modifiers) ? nil : Unmanaged.passUnretained(event)
+        }
+
+        guard let eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(1 << NX_SYSDEFINED),
+            callback: callback,
+            userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        ) else {
+            return false
+        }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        self.eventTap = eventTap
+        runLoopSource = source
+        return true
+    }
+
+    func stop() {
+        if let eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+        }
+        if let runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        }
+        eventTap = nil
+        runLoopSource = nil
+    }
+}
+
+func isBuiltInScreen(_ screen: NSScreen) -> Bool {
+    guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+        return false
+    }
+    return CGDisplayIsBuiltin(CGDirectDisplayID(number.uint32Value)) != 0
+}
+
+func screenUnderMouse() -> NSScreen? {
+    let location = NSEvent.mouseLocation
+    return NSScreen.screens.first { NSMouseInRect(location, $0.frame, false) }
+}
+
+// MARK: - On-Screen Display
+
+class OSDWindowController {
+    private var panel: NSPanel?
+    private var iconView: NSImageView!
+    private var levelView: NSProgressIndicator!
+    private var hideWorkItem: DispatchWorkItem?
+
+    func show(symbolName: String, level: Double, on screen: NSScreen?) {
+        let panel = self.panel ?? makePanel()
+        self.panel = panel
+
+        iconView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
+        levelView.doubleValue = min(max(level, 0), 1) * 100
+
+        let targetScreen = screen ?? NSScreen.main
+        if let frame = targetScreen?.visibleFrame {
+            let size = panel.frame.size
+            panel.setFrameOrigin(NSPoint(x: frame.midX - size.width / 2, y: frame.minY + 90))
+        }
+
+        panel.alphaValue = 1
+        panel.orderFrontRegardless()
+
+        hideWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak panel] in
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.3
+                panel?.animator().alphaValue = 0
+            }, completionHandler: {
+                panel?.orderOut(nil)
+            })
+        }
+        hideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4, execute: workItem)
+    }
+
+    private func makePanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 240, height: 54),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.overlayWindow)))
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+
+        let effectView = NSVisualEffectView(frame: panel.contentView?.bounds ?? .zero)
+        effectView.material = .hudWindow
+        effectView.state = .active
+        effectView.wantsLayer = true
+        effectView.layer?.cornerRadius = 14
+        effectView.layer?.masksToBounds = true
+        panel.contentView = effectView
+
+        iconView = NSImageView(frame: NSRect(x: 16, y: 15, width: 24, height: 24))
+        iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 17, weight: .medium)
+        iconView.contentTintColor = .labelColor
+        effectView.addSubview(iconView)
+
+        levelView = NSProgressIndicator(frame: NSRect(x: 52, y: 19, width: 168, height: 16))
+        levelView.style = .bar
+        levelView.isIndeterminate = false
+        levelView.minValue = 0
+        levelView.maxValue = 100
+        effectView.addSubview(levelView)
+
+        return panel
+    }
+}
+
 // MARK: - Settings Delegate
 
 protocol SettingsDelegate: AnyObject {
@@ -648,8 +1021,13 @@ protocol SettingsDelegate: AnyObject {
 
 // MARK: - App Delegate
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
+    let displayAdjustments = DisplayAdjustmentController()
+    let mediaKeyTap = MediaKeyTap()
+    let osd = OSDWindowController()
+    var brightnessSliderView: MenuSliderView?
+    var volumeSliderView: MenuSliderView?
     var menu: NSMenu!
     var currentInputValue: Int?
     var lastSelectedInputValue: Int?
@@ -705,6 +1083,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         peerManager?.delegate = self
         peerManager?.start()
         startMonitorStatusTimer()
+        mediaKeyTap.handler = { [weak self] key, isKeyDown, modifiers in
+            self?.handleMediaKey(key, isKeyDown: isKeyDown, modifiers: modifiers) ?? false
+        }
+        updateMediaKeyTap(promptForPermission: false)
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screenParametersDidChange),
@@ -758,6 +1140,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func buildMenu() {
         menu = NSMenu()
         menu.minimumWidth = 260
+        menu.delegate = self
+        brightnessSliderView = nil
+        volumeSliderView = nil
 
         let titleItem = NSMenuItem()
         titleItem.view = makeHeaderView()
@@ -816,6 +1201,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             menu.addItem(.separator())
 
+            if currentDisplayOption() != nil {
+                addAdjustmentItems(to: menu)
+                menu.addItem(.separator())
+            }
+
             let cycleItem = NSMenuItem(title: cycleMenuTitle(), action: #selector(cycleShortcutInputsFromMenu), keyEquivalent: "")
             cycleItem.target = self
             cycleItem.image = NSImage(systemSymbolName: "arrow.left.arrow.right.circle", accessibilityDescription: nil)
@@ -831,6 +1221,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ownerTitleItem.target = self
             ownerTitleItem.state = showOwnerInMenuBar ? .on : .off
             menu.addItem(ownerTitleItem)
+
+            let keysItem = NSMenuItem(title: loc("Klavye Tuşları", "Keyboard Keys"), action: nil, keyEquivalent: "")
+            keysItem.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: nil)
+            let keysMenu = NSMenu()
+            let brightnessKeysItem = NSMenuItem(title: loc("Parlaklık tuşları harici monitörü ayarlasın", "Brightness keys control the external display"), action: #selector(toggleBrightnessKeys), keyEquivalent: "")
+            brightnessKeysItem.target = self
+            brightnessKeysItem.state = brightnessKeysEnabled ? .on : .off
+            brightnessKeysItem.toolTip = loc("İmleç harici monitördeyken parlaklık tuşları DDC ile monitörü ayarlar. Erişilebilirlik izni gerekir.", "While the pointer is on the external display, brightness keys adjust it over DDC. Requires Accessibility permission.")
+            keysMenu.addItem(brightnessKeysItem)
+            let volumeKeysItem = NSMenuItem(title: loc("Ses tuşları monitör hoparlörünü ayarlasın", "Volume keys control the display speakers"), action: #selector(toggleVolumeKeys), keyEquivalent: "")
+            volumeKeysItem.target = self
+            volumeKeysItem.state = volumeKeysEnabled ? .on : .off
+            volumeKeysItem.toolTip = loc("Monitör bu Mac'e bağlıyken ses tuşları monitör hoparlörünü DDC ile ayarlar. Erişilebilirlik izni gerekir.", "While the display is attached to this Mac, volume keys adjust its speakers over DDC. Requires Accessibility permission.")
+            keysMenu.addItem(volumeKeysItem)
+            if (brightnessKeysEnabled || volumeKeysEnabled) && !mediaKeyTap.isRunning {
+                keysMenu.addItem(.separator())
+                let permissionItem = NSMenuItem(title: loc("⚠️ Erişilebilirlik izni gerekli...", "⚠️ Accessibility permission needed..."), action: #selector(openAccessibilitySettings), keyEquivalent: "")
+                permissionItem.target = self
+                keysMenu.addItem(permissionItem)
+            }
+            keysItem.submenu = keysMenu
+            menu.addItem(keysItem)
 
             menu.addItem(.separator())
         }
@@ -1104,6 +1516,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.monitorTimerTicks += 1
                 if self.monitorTimerTicks % 2 == 0 {
                     self.sampleCurrentInputForLearning()
+                }
+                if (self.brightnessKeysEnabled || self.volumeKeysEnabled) && !self.mediaKeyTap.isRunning {
+                    self.updateMediaKeyTap(promptForPermission: false)
                 }
             }
         }
@@ -1489,6 +1904,172 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let shortLabel = label.count > maxLength ? String(label.prefix(maxLength - 1)) + "…" : label
         button.title = " \(shortLabel)"
         button.imagePosition = .imageLeading
+    }
+
+    // MARK: Display adjustments
+
+    func addAdjustmentItems(to menu: NSMenu) {
+        let brightnessView = MenuSliderView(symbolName: "sun.max", accessibilityLabel: loc("Parlaklık", "Brightness"))
+        brightnessView.toolTip = loc("Monitör parlaklığı (DDC)", "Display brightness (DDC)")
+        brightnessView.onChange = { [weak self] value in
+            guard let self, let displayIndex = self.currentDisplayIndex() else { return }
+            self.displayAdjustments.set(.luminance, value: value, displayIndex: displayIndex)
+        }
+        let brightnessItem = NSMenuItem()
+        brightnessItem.view = brightnessView
+        menu.addItem(brightnessItem)
+        brightnessSliderView = brightnessView
+
+        let volumeView = MenuSliderView(symbolName: displayAdjustments.isMuted ? "speaker.slash" : "speaker.wave.2", accessibilityLabel: loc("Ses", "Volume"))
+        volumeView.toolTip = loc("Monitör hoparlör sesi (DDC). Simgeye tıkla: sessiz.", "Display speaker volume (DDC). Click the icon to mute.")
+        volumeView.onChange = { [weak self] value in
+            guard let self, let displayIndex = self.currentDisplayIndex() else { return }
+            self.displayAdjustments.set(.volume, value: value, displayIndex: displayIndex)
+        }
+        volumeView.onIconClick = { [weak self] in
+            self?.toggleDisplayMute()
+        }
+        let volumeItem = NSMenuItem()
+        volumeItem.view = volumeView
+        menu.addItem(volumeItem)
+        volumeSliderView = volumeView
+
+        updateAdjustmentSliders()
+    }
+
+    func updateAdjustmentSliders() {
+        brightnessSliderView?.update(value: displayAdjustments.values[.luminance], maxValue: displayAdjustments.maxValue(for: .luminance))
+        volumeSliderView?.update(value: displayAdjustments.values[.volume], maxValue: displayAdjustments.maxValue(for: .volume))
+        volumeSliderView?.iconButton.image = NSImage(
+            systemSymbolName: displayAdjustments.isMuted ? "speaker.slash" : "speaker.wave.2",
+            accessibilityDescription: loc("Ses", "Volume")
+        )
+    }
+
+    func refreshAdjustments(completion: (() -> Void)? = nil) {
+        guard let displayIndex = currentDisplayIndex() else { return }
+        displayAdjustments.refresh(displayIndex: displayIndex) { [weak self] in
+            self?.updateAdjustmentSliders()
+            completion?()
+        }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === self.menu else { return }
+        refreshAdjustments()
+    }
+
+    func toggleDisplayMute() {
+        guard let displayIndex = currentDisplayIndex() else { return }
+        let muted = displayAdjustments.toggleMute(displayIndex: displayIndex)
+        updateAdjustmentSliders()
+        let volume = Double(displayAdjustments.values[.volume] ?? 0) / Double(displayAdjustments.maxValue(for: .volume))
+        osd.show(symbolName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill", level: muted ? 0 : volume, on: screenUnderMouse())
+    }
+
+    // MARK: Media keys
+
+    var brightnessKeysEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "brightnessKeysControlDisplay") }
+        set { UserDefaults.standard.set(newValue, forKey: "brightnessKeysControlDisplay") }
+    }
+
+    var volumeKeysEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "volumeKeysControlDisplay") }
+        set { UserDefaults.standard.set(newValue, forKey: "volumeKeysControlDisplay") }
+    }
+
+    @objc func toggleBrightnessKeys() {
+        brightnessKeysEnabled.toggle()
+        updateMediaKeyTap(promptForPermission: brightnessKeysEnabled)
+        buildMenu()
+    }
+
+    @objc func toggleVolumeKeys() {
+        volumeKeysEnabled.toggle()
+        updateMediaKeyTap(promptForPermission: volumeKeysEnabled)
+        buildMenu()
+    }
+
+    @objc func openAccessibilitySettings() {
+        _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func updateMediaKeyTap(promptForPermission: Bool) {
+        guard brightnessKeysEnabled || volumeKeysEnabled else {
+            if mediaKeyTap.isRunning {
+                mediaKeyTap.stop()
+                logDiagnostics("Media key tap stopped")
+            }
+            return
+        }
+
+        guard !mediaKeyTap.isRunning else { return }
+
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: promptForPermission] as CFDictionary
+        guard AXIsProcessTrustedWithOptions(options) else {
+            if promptForPermission {
+                logDiagnostics("Media key tap waiting for Accessibility permission")
+            }
+            return
+        }
+
+        if mediaKeyTap.start() {
+            logDiagnostics("Media key tap started")
+            buildMenu()
+        } else {
+            logDiagnostics("Media key tap failed to start")
+        }
+    }
+
+    func handleMediaKey(_ key: MediaKey, isKeyDown: Bool, modifiers: NSEvent.ModifierFlags) -> Bool {
+        guard let displayIndex = currentDisplayIndex() else { return false }
+
+        let control: DDCControl
+        let isIncrease: Bool
+        switch key {
+        case .brightnessUp, .brightnessDown:
+            guard brightnessKeysEnabled else { return false }
+            if let screen = screenUnderMouse(), isBuiltInScreen(screen) {
+                return false
+            }
+            control = .luminance
+            isIncrease = key == .brightnessUp
+        case .soundUp, .soundDown:
+            guard volumeKeysEnabled else { return false }
+            control = .volume
+            isIncrease = key == .soundUp
+        case .mute:
+            guard volumeKeysEnabled else { return false }
+            if isKeyDown {
+                toggleDisplayMute()
+            }
+            return true
+        }
+
+        guard isKeyDown else { return true }
+
+        let isFineStep = modifiers.contains(.option) && modifiers.contains(.shift)
+        let fraction = (isFineStep ? 1.0 / 64.0 : 1.0 / 16.0) * (isIncrease ? 1 : -1)
+
+        let applyStep = { [weak self] in
+            guard let self else { return }
+            let value = self.displayAdjustments.step(control, fraction: fraction, displayIndex: displayIndex)
+            let level = Double(value) / Double(self.displayAdjustments.maxValue(for: control))
+            let symbol = control == .luminance ? "sun.max.fill" : (level == 0 ? "speaker.fill" : "speaker.wave.2.fill")
+            self.updateAdjustmentSliders()
+            self.osd.show(symbolName: symbol, level: level, on: screenUnderMouse())
+        }
+
+        if displayAdjustments.values[control] == nil || displayAdjustments.loadedDisplayIndex != displayIndex {
+            refreshAdjustments(completion: applyStep)
+        } else {
+            applyStep()
+        }
+        return true
     }
 
     @objc func toggleShowOwnerInMenuBar() {
