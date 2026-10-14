@@ -86,11 +86,6 @@ struct ShellResult {
     let output: String
 }
 
-struct DiscoveryProbe {
-    let label: String
-    let source: InputSource
-}
-
 // MARK: - Localization
 
 enum AppLanguage: String, CaseIterable {
@@ -2273,6 +2268,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             displays: settingsDisplays
         )
         settingsWindowController?.delegate = self
+        settingsWindowController?.activeInputHint = currentInputValue ?? lastSelectedInputValue
         settingsWindowController?.showWindow(nil)
         settingsWindowController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -3251,6 +3247,7 @@ class SettingsWindowController: NSWindowController {
     var shortcutClearButton: NSButton!
     var displayPopup: NSPopUpButton!
     var discoverButton: NSButton!
+    var activeInputHint: Int?
 
     init(inputs: [InputSource], shortcutConfig: ShortcutConfig?, selectedDisplayIndex: Int, selectedDisplayTitle: String?, displays: [DisplayOption]) {
         self.inputs = inputs
@@ -3397,7 +3394,7 @@ class SettingsWindowController: NSWindowController {
         discoverButton.bezelStyle = .rounded
         discoverButton.target = self
         discoverButton.action = #selector(discoverInputs)
-        discoverButton.toolTip = loc("Yaygın input/input-alt değerlerini dener, ekran değişirse otomatik geri döner ve çalışan değerleri listeye uygular.", "Tries common input/input-alt values, switches back automatically when the screen changes, and can apply the working values to the list.")
+        discoverButton.toolTip = loc("Yaygın input/input-alt değerlerini sırayla dener, her denemeden sonra ne gördüğünü sorar ve bulunan değerleri listeye uygular.", "Tries common input/input-alt values one by one, asks what you saw after each try, and can apply the findings to the list.")
         contentView.addSubview(discoverButton)
 
         let diagnosticsButton = NSButton(frame: NSRect(x: 780, y: 140, width: 140, height: 28))
@@ -3532,25 +3529,6 @@ class SettingsWindowController: NSWindowController {
         }
     }
 
-    func commonDiscoveryProbes(for displayTitle: String) -> [DiscoveryProbe] {
-        let isLikelyLG = displayTitle.lowercased().contains("lg")
-        let lgCandidates: [DiscoveryProbe] = [
-            DiscoveryProbe(label: "DisplayPort 1", source: InputSource(name: "DisplayPort 1", value: 208, icon: "cable.connector.horizontal", nickname: "", includeInShortcutCycle: false, commandMode: .lgAlternate)),
-            DiscoveryProbe(label: "DisplayPort 2", source: InputSource(name: "DisplayPort 2", value: 209, icon: "cable.connector.horizontal", nickname: "", includeInShortcutCycle: false, commandMode: .lgAlternate)),
-            DiscoveryProbe(label: "HDMI 1", source: InputSource(name: "HDMI 1", value: 144, icon: "tv", nickname: "", includeInShortcutCycle: false, commandMode: .lgAlternate)),
-            DiscoveryProbe(label: "HDMI 2", source: InputSource(name: "HDMI 2", value: 145, icon: "tv", nickname: "", includeInShortcutCycle: false, commandMode: .lgAlternate)),
-            DiscoveryProbe(label: "USB-C", source: InputSource(name: "USB-C", value: 210, icon: "cable.connector", nickname: "", includeInShortcutCycle: false, commandMode: .lgAlternate))
-        ]
-        let standardCandidates: [DiscoveryProbe] = [
-            DiscoveryProbe(label: "DisplayPort 1", source: InputSource(name: "DisplayPort 1", value: 15, icon: "cable.connector.horizontal", nickname: "", includeInShortcutCycle: false, commandMode: .standard)),
-            DiscoveryProbe(label: "DisplayPort 2", source: InputSource(name: "DisplayPort 2", value: 16, icon: "cable.connector.horizontal", nickname: "", includeInShortcutCycle: false, commandMode: .standard)),
-            DiscoveryProbe(label: "HDMI 1", source: InputSource(name: "HDMI 1", value: 17, icon: "tv", nickname: "", includeInShortcutCycle: false, commandMode: .standard)),
-            DiscoveryProbe(label: "HDMI 2", source: InputSource(name: "HDMI 2", value: 18, icon: "tv", nickname: "", includeInShortcutCycle: false, commandMode: .standard)),
-            DiscoveryProbe(label: "USB-C", source: InputSource(name: "USB-C", value: 27, icon: "cable.connector", nickname: "", includeInShortcutCycle: false, commandMode: .standard))
-        ]
-        return isLikelyLG ? (lgCandidates + standardCandidates) : (standardCandidates + lgCandidates)
-    }
-
     @objc func toggleShortcutRecording() {
         shortcutRecordButton.beginRecording()
     }
@@ -3608,11 +3586,55 @@ class SettingsWindowController: NSWindowController {
         }
     }
 
-    struct DiscoveryResult {
-        let probe: DiscoveryProbe
-        let switched: Bool
-        let detectedValue: Int?
-        let cameBack: Bool
+    // MARK: - Guided Discovery
+
+    struct DiscoveryCandidate: Equatable {
+        let mode: InputCommandMode
+        let value: Int
+
+        var command: String { "\(mode.commandName) \(value)" }
+    }
+
+    enum DiscoveryAnswer {
+        case noChange
+        case unsure
+        case port(String)
+    }
+
+    final class DiscoverySession {
+        let display: DisplayOption
+        let home: InputSource
+        let candidates: [DiscoveryCandidate]
+        var index = 0
+        var answers: [(candidate: DiscoveryCandidate, answer: DiscoveryAnswer)] = []
+        var stoppedEarly = false
+
+        init(display: DisplayOption, home: InputSource, candidates: [DiscoveryCandidate]) {
+            self.display = display
+            self.home = home
+            self.candidates = candidates
+        }
+    }
+
+    static let discoveryStandardPortNames = ["DisplayPort 1", "DisplayPort 2", "HDMI 1", "HDMI 2", "USB-C"]
+
+    func discoveryCandidates(for displayTitle: String, home: InputSource) -> [DiscoveryCandidate] {
+        let alternate = [208, 209, 210, 144, 145].map { DiscoveryCandidate(mode: .lgAlternate, value: $0) }
+        let standard = [15, 16, 17, 18, 27].map { DiscoveryCandidate(mode: .standard, value: $0) }
+        let isLikelyLG = displayTitle.lowercased().contains("lg")
+        let homeMode = DDCController.resolvedCommandMode(home.commandMode, displayTitle: displayTitle)
+        let homeValue = DDCController.resolvedDDCValue(for: home.value, mode: home.commandMode, displayTitle: displayTitle)
+        return (isLikelyLG ? alternate + standard : standard + alternate)
+            .filter { !($0.mode == homeMode && $0.value == homeValue) }
+    }
+
+    func makeMenuPopup(titles: [String], width: CGFloat) -> NSPopUpButton {
+        // addItem(withTitle:) merges duplicate titles, so build the items by hand.
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: width, height: 26), pullsDown: false)
+        for title in titles {
+            popup.menu?.addItem(NSMenuItem(title: title, action: nil, keyEquivalent: ""))
+        }
+        return popup
     }
 
     @objc func discoverInputs() {
@@ -3621,167 +3643,261 @@ class SettingsWindowController: NSWindowController {
             return
         }
 
+        let rowSources = rows.indices.compactMap { inputSourceForRow($0) }
+        guard !rowSources.isEmpty else { return }
+
+        let homePopup = makeMenuPopup(
+            titles: rowSources.map { $0.trimmedNickname.isEmpty ? $0.name : "\($0.name) (\($0.trimmedNickname))" },
+            width: 360
+        )
+        if let activeInputHint, let hintIndex = rowSources.firstIndex(where: { $0.value == activeInputHint }) {
+            homePopup.selectItem(at: hintIndex)
+        }
+        homePopup.frame.origin = NSPoint(x: 0, y: 0)
+
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 56))
+        accessory.addSubview(makeLabel(loc("Bu Mac hangi porta bağlı?", "Which port is THIS Mac connected to?"), frame: NSRect(x: 0, y: 32, width: 360, height: 18)))
+        accessory.addSubview(homePopup)
+
         let alert = NSAlert()
-        alert.messageText = loc("Otomatik input keşfi başlatılsın mı?", "Start automatic input discovery?")
+        alert.messageText = loc("Adım adım input keşfi", "Guided input discovery")
         alert.informativeText = loc(
-            "Yaygın input ve input-alt değerleri sırayla denenecek. Ekran başka bir kaynağa geçerse uygulama otomatik olarak geri dönmeye çalışır (doğrudan ya da diğer Mac üzerinden).\n\nEkran boş bir girişte kalırsa monitörün input tuşuyla bu Mac'e dön; keşif kaldığı yerden sonuçları gösterir.\n\nBitince bulunan değerleri listeye uygulayabilirsin.",
-            "Common input and input-alt values will be tried one by one. When the screen switches to another source, the app tries to switch back automatically (directly or through the other Mac).\n\nIf the screen gets stuck on an empty input, use the display's input button to come back to this Mac; discovery will then show what it found.\n\nWhen it's done you can apply the values it found to the list."
+            "Ekran kısa süreliğine diğer portlara geçip geri dönecek. Her denemeden sonra ne gördüğün sorulacak.\n\nEkran geri dönmezse monitörün input tuşuyla bu Mac'in portuna dön; keşif kaldığı yerden devam eder.",
+            "The screen will briefly switch to other ports and come back. After each try you will be asked what you saw.\n\nIf it doesn't come back, press the monitor's input button to return to this Mac's port; discovery then continues."
         )
         alert.alertStyle = .warning
+        alert.accessoryView = accessory
         alert.addButton(withTitle: loc("Başlat", "Start"))
         alert.addButton(withTitle: loc("İptal", "Cancel"))
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        let probes = commonDiscoveryProbes(for: display.title)
-        let rowSources = rows.indices.compactMap { inputSourceForRow($0) }
+        let home = rowSources[max(0, homePopup.indexOfSelectedItem)]
+        let candidates = discoveryCandidates(for: display.title, home: home)
+        guard !candidates.isEmpty else { return }
+
+        let session = DiscoverySession(display: display, home: home, candidates: candidates)
         setTestingUIEnabled(false)
-        logDiagnostics("Discovery started: display=\(display.title) probes=\(probes.map { "\($0.label)=\($0.source.commandMode.rawValue):\($0.source.value)" }.joined(separator: ","))")
+        logDiagnostics("Guided discovery started: display=\(display.title) home=\(home.menuLabel) \(home.commandMode.rawValue):\(home.value) candidates=\(candidates.map { $0.command }.joined(separator: ","))")
+        runDiscoveryStep(session)
+    }
+
+    // Runs on main; each step hops to a background queue for DDC work and back to main for the alert.
+    func runDiscoveryStep(_ session: DiscoverySession) {
+        guard session.index < session.candidates.count else {
+            finishDiscovery(session)
+            return
+        }
+
+        let candidate = session.candidates[session.index]
+        let display = session.display
+        logDiagnostics("Discovery try \(session.index + 1)/\(session.candidates.count): \(candidate.command)")
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let originalValue = DDCController.getCurrentInput(displayIndex: display.index)
-            let originalSource = originalValue.map { value in
-                rowSources.first(where: { $0.value == value }) ?? InputSource(name: "Input \(value)", value: value, icon: "display", nickname: "", includeInShortcutCycle: false, commandMode: .standard)
+            let before = DDCController.getCurrentInput(displayIndex: display.index)
+            let probe = InputSource(name: "Discovery", value: candidate.value, icon: "display", nickname: "", includeInShortcutCycle: false, commandMode: candidate.mode)
+            let result = DDCController.setInput(probe, displayIndex: display.index, displayTitle: display.title)
+
+            guard result.status == 0 else {
+                DispatchQueue.main.async {
+                    logDiagnostics("Discovery stopped: command failed output=\(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+                    self.setTestingUIEnabled(true)
+                    let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.presentWarningAlert(
+                        title: loc("Komut başarısız", "Command failed"),
+                        message: output.isEmpty ? loc("m1ddc komutu başarısız oldu.", "The m1ddc command failed.") : output
+                    )
+                    self.presentDiscoverySummary(session)
+                }
+                return
             }
-            logDiagnostics("Discovery original input: \(originalValue.map(String.init) ?? "-")")
 
-            var results: [DiscoveryResult] = []
-            var stoppedEarly = false
-
-            for probe in probes {
-                if let originalValue, probe.source.commandMode == .standard, probe.source.value == originalValue {
-                    results.append(DiscoveryResult(probe: probe, switched: false, detectedValue: originalValue, cameBack: true))
-                    continue
-                }
-
-                let result = DDCController.setInput(probe.source, displayIndex: display.index, displayTitle: display.title)
-                guard result.status == 0 else {
-                    results.append(DiscoveryResult(probe: probe, switched: false, detectedValue: nil, cameBack: true))
-                    continue
-                }
-
-                var switched = false
-                var detectedValue: Int?
-                for _ in 0..<6 {
-                    Thread.sleep(forTimeInterval: 0.5)
-                    if !self.monitorStillLocal(display.title) {
-                        switched = true
-                        break
-                    }
-                    detectedValue = DDCController.getCurrentInput(displayIndex: display.index)
-                    if let detectedValue, let originalValue, detectedValue != originalValue {
-                        switched = true
-                        break
-                    }
-                }
-
-                guard switched else {
-                    results.append(DiscoveryResult(probe: probe, switched: false, detectedValue: detectedValue, cameBack: true))
-                    logDiagnostics("Discovery probe: \(probe.label) \(probe.source.commandMode.rawValue):\(probe.source.value) -> no change")
-                    continue
-                }
-
-                logDiagnostics("Discovery probe: \(probe.label) \(probe.source.commandMode.rawValue):\(probe.source.value) -> switched detected=\(detectedValue.map(String.init) ?? "-")")
-                let cameBack = self.returnToOriginalInput(originalSource, display: display)
-                results.append(DiscoveryResult(probe: probe, switched: true, detectedValue: detectedValue, cameBack: cameBack))
-
-                if !cameBack {
-                    stoppedEarly = true
-                    logDiagnostics("Discovery stopped: display did not come back after \(probe.label)")
-                    break
-                }
+            Thread.sleep(forTimeInterval: 3.0)
+            var evidence = false
+            if !self.monitorStillLocal(display.title) {
+                evidence = true
+            } else if let after = DDCController.getCurrentInput(displayIndex: display.index), after != before {
+                evidence = true
             }
+            logDiagnostics("Discovery try evidence: \(candidate.command) switchedAutomatically=\(evidence)")
+
+            let cameBack = self.returnToHome(session)
 
             DispatchQueue.main.async {
-                self.setTestingUIEnabled(true)
-                self.presentDiscoveryResults(results, originalValue: originalValue, stoppedEarly: stoppedEarly)
+                guard self.window?.isVisible == true else {
+                    logDiagnostics("Discovery aborted: settings window closed")
+                    self.setTestingUIEnabled(true)
+                    return
+                }
+                if !cameBack { session.stoppedEarly = true }
+                self.promptDiscoveryAnswer(session, candidate: candidate, evidence: evidence)
             }
         }
     }
 
-    func returnToOriginalInput(_ originalSource: InputSource?, display: DisplayOption) -> Bool {
-        guard let originalSource else { return waitForDisplayToReturn(display: display, seconds: 60) }
+    // Background only. Returns true when the display was back within ~60 s; keeps waiting after that while the window is open.
+    func returnToHome(_ session: DiscoverySession) -> Bool {
+        let display = session.display
+        let start = Date()
+        var lastPeerRequest = Date.distantPast
 
-        var askedPeer = false
-        for _ in 0..<20 {
+        while true {
+            let elapsed = Date().timeIntervalSince(start)
             if monitorStillLocal(display.title) {
-                if DDCController.getCurrentInput(displayIndex: display.index) == originalSource.value {
-                    return true
-                }
-                _ = DDCController.setInput(originalSource, displayIndex: display.index, displayTitle: display.title)
-            } else if !askedPeer {
-                askedPeer = DispatchQueue.main.sync {
-                    self.delegate?.broadcastRemoteSwitch(inputValue: originalSource.value, displayTitle: display.title) ?? false
-                }
-            }
-            Thread.sleep(forTimeInterval: 1.0)
-        }
-
-        return waitForDisplayToReturn(display: display, seconds: 60)
-    }
-
-    func waitForDisplayToReturn(display: DisplayOption, seconds: Int) -> Bool {
-        for _ in 0..<seconds {
-            if monitorStillLocal(display.title) {
+                _ = DDCController.setInput(session.home, displayIndex: display.index, displayTitle: display.title)
                 Thread.sleep(forTimeInterval: 1.5)
-                return true
+                logDiagnostics("Discovery returned home after \(Int(elapsed)) s")
+                return elapsed <= 60
             }
+
+            if elapsed <= 60, Date().timeIntervalSince(lastPeerRequest) >= 20 {
+                lastPeerRequest = Date()
+                let asked = DispatchQueue.main.sync {
+                    self.delegate?.broadcastRemoteSwitch(inputValue: session.home.value, displayTitle: display.title) ?? false
+                }
+                logDiagnostics("Discovery asked peer to switch back: sent=\(asked)")
+            }
+
+            if DispatchQueue.main.sync(execute: { self.window?.isVisible != true }) { return false }
             Thread.sleep(forTimeInterval: 1.0)
         }
-        return false
     }
 
-    func presentDiscoveryResults(_ results: [DiscoveryResult], originalValue: Int?, stoppedEarly: Bool) {
-        let working = results.filter { $0.switched }
-        var lines: [String] = []
-
-        if let originalValue {
-            lines.append(loc("Bu Mac'in girişi: \(originalValue)", "This Mac's input: \(originalValue)"))
-        }
-        for result in results {
-            let command = "\(result.probe.source.commandMode.commandName) \(result.probe.source.value)"
-            let status: String
-            if result.probe.source.value == originalValue && result.probe.source.commandMode == .standard {
-                status = loc("bu Mac", "this Mac")
-            } else if result.switched {
-                status = result.cameBack ? loc("✓ çalışıyor", "✓ works") : loc("✓ çalışıyor (geri dönülemedi)", "✓ works (could not return)")
-            } else {
-                status = loc("etkisiz", "no effect")
+    func promptDiscoveryAnswer(_ session: DiscoverySession, candidate: DiscoveryCandidate, evidence: Bool) {
+        var portNames = SettingsWindowController.discoveryStandardPortNames
+        for row in rows {
+            let name = row.nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty, !portNames.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
+                portNames.append(name)
             }
-            lines.append("\(result.probe.label) — \(command): \(status)")
         }
-        if stoppedEarly {
-            lines.append("")
-            lines.append(loc("Keşif erken durdu; kalan değerler denenmedi.", "Discovery stopped early; the remaining values were not tried."))
+
+        let noChangeTitle = loc("Değişiklik yok", "No change")
+        let unsureTitle = loc("Değişti, hangi port olduğundan emin değilim", "Switched, not sure which port")
+        let popup = makeMenuPopup(titles: [noChangeTitle] + portNames + [unsureTitle], width: 320)
+        if evidence { popup.selectItem(at: portNames.count + 1) }
+
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 30))
+        accessory.addSubview(popup)
+
+        var message = loc("Ekran değişti mi? Monitör hangi portu gösterdi?", "Did the screen switch? Which port did the monitor show?")
+        if evidence {
+            message += "\n\n" + loc("Otomatik kontrol: monitör bir değişiklik bildirdi.", "Automatic check: the display reported a change.")
+        }
+        if session.stoppedEarly {
+            message += "\n\n" + loc("Monitör 60 sn içinde dönmedi; bu cevaptan sonra keşif özet ile bitecek.", "The display did not return within 60 s; discovery ends with the summary after this answer.")
         }
 
         let alert = NSAlert()
-        alert.messageText = working.isEmpty
-            ? loc("Çalışan yeni input bulunamadı", "No working inputs found")
-            : loc("\(working.count) çalışan input bulundu", "Found \(working.count) working input(s)")
+        alert.messageText = loc("Deneme \(session.index + 1)/\(session.candidates.count): \(candidate.command)", "Try \(session.index + 1)/\(session.candidates.count): \(candidate.command)")
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.accessoryView = accessory
+        alert.addButton(withTitle: loc("Sonraki", "Next"))
+        alert.addButton(withTitle: loc("Bu değeri tekrar dene", "Retry this value"))
+        alert.addButton(withTitle: loc("Şimdi bitir", "Finish now"))
+
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn, !session.stoppedEarly {
+            logDiagnostics("Discovery retry: \(candidate.command)")
+            runDiscoveryStep(session)
+            return
+        }
+
+        let selected = popup.indexOfSelectedItem
+        let answer: DiscoveryAnswer
+        if selected <= 0 {
+            answer = .noChange
+        } else if selected > portNames.count {
+            answer = .unsure
+        } else {
+            answer = .port(portNames[selected - 1])
+        }
+        session.answers.append((candidate: candidate, answer: answer))
+        logDiagnostics("Discovery answer: \(candidate.command) -> \(answer)")
+        session.index += 1
+
+        if response == .alertThirdButtonReturn || session.stoppedEarly {
+            finishDiscovery(session)
+        } else {
+            runDiscoveryStep(session)
+        }
+    }
+
+    func finishDiscovery(_ session: DiscoverySession) {
+        setTestingUIEnabled(true)
+        logDiagnostics("Guided discovery finished: answers=\(session.answers.count)/\(session.candidates.count) stoppedEarly=\(session.stoppedEarly)")
+        presentDiscoverySummary(session)
+    }
+
+    func rowForPortName(_ name: String) -> InputRowControls? {
+        rows.first {
+            $0.nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(name) == .orderedSame
+        }
+    }
+
+    func presentDiscoverySummary(_ session: DiscoverySession) {
+        var found: [(port: String, candidate: DiscoveryCandidate)] = []
+        var unknown: [DiscoveryCandidate] = []
+        var noEffect: [DiscoveryCandidate] = []
+        for entry in session.answers {
+            switch entry.answer {
+            case .port(let name): found.append((port: name, candidate: entry.candidate))
+            case .unsure: unknown.append(entry.candidate)
+            case .noChange: noEffect.append(entry.candidate)
+            }
+        }
+        let untried = session.candidates.filter { candidate in !session.answers.contains(where: { $0.candidate == candidate }) }
+
+        var lines: [String] = [loc("Bu Mac: \(session.home.menuLabel)", "This Mac: \(session.home.menuLabel)")]
+        var toApply: [(port: String, candidate: DiscoveryCandidate)] = []
+        var seenPorts = Set<String>()
+        for entry in found {
+            let key = entry.port.lowercased()
+            let command = "\(entry.port) — \(entry.candidate.command)"
+            if seenPorts.contains(key) {
+                lines.append("\(command) " + loc("(ikinci değer, kullanılmaz)", "(second value, not used)"))
+            } else if rowForPortName(entry.port) == nil {
+                seenPorts.insert(key)
+                lines.append("\(command) " + loc("(bu adda satır yok, uygulanmaz)", "(no row with this name, not applied)"))
+            } else {
+                seenPorts.insert(key)
+                toApply.append(entry)
+                lines.append(command)
+            }
+        }
+        if !unknown.isEmpty {
+            lines.append(loc("Değişti, port bilinmiyor: ", "Switched, port unknown: ") + unknown.map { $0.command }.joined(separator: ", "))
+        }
+        if !noEffect.isEmpty {
+            lines.append(loc("Etkisiz: ", "No effect: ") + noEffect.map { $0.command }.joined(separator: ", "))
+        }
+        if !untried.isEmpty {
+            lines.append(loc("Denenmedi: ", "Not tried: ") + untried.map { $0.command }.joined(separator: ", "))
+        }
+
+        let alert = NSAlert()
+        alert.messageText = found.isEmpty
+            ? loc("Port eşleştirilemedi", "No ports identified")
+            : loc("\(seenPorts.count) port eşleştirildi", "Identified \(seenPorts.count) port(s)")
         alert.informativeText = lines.joined(separator: "\n")
         alert.alertStyle = .informational
-        if !working.isEmpty {
+        if !toApply.isEmpty {
             alert.addButton(withTitle: loc("Listeye Uygula", "Apply to List"))
         }
         alert.addButton(withTitle: loc("Kapat", "Close"))
 
         let response = alert.runModal()
-        guard !working.isEmpty, response == .alertFirstButtonReturn else { return }
+        guard !toApply.isEmpty, response == .alertFirstButtonReturn else { return }
 
-        var appliedLabels = Set<String>()
-        for result in working where !appliedLabels.contains(result.probe.label) {
-            guard let row = rows.first(where: {
-                $0.nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(result.probe.label) == .orderedSame
-            }) else { continue }
-
-            row.valueField.stringValue = "\(result.probe.source.value)"
-            if let modeIndex = InputCommandMode.allCases.firstIndex(of: result.probe.source.commandMode) {
+        for entry in toApply {
+            guard let row = rowForPortName(entry.port) else { continue }
+            row.valueField.stringValue = "\(entry.candidate.value)"
+            if let modeIndex = InputCommandMode.allCases.firstIndex(of: entry.candidate.mode) {
                 row.commandModePopup.selectItem(at: modeIndex)
             }
-            appliedLabels.insert(result.probe.label)
         }
-        logDiagnostics("Discovery applied: \(appliedLabels.sorted().joined(separator: ","))")
+        logDiagnostics("Discovery applied: \(toApply.map { "\($0.port)=\($0.candidate.command)" }.joined(separator: ","))")
         shortcutHelpLabel.stringValue = loc("Keşif sonuçları listeye uygulandı. Kalıcı olması için Kaydet'e bas.", "Discovery results applied to the list. Press Save to keep them.")
     }
 
